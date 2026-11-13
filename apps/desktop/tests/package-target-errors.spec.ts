@@ -14,6 +14,11 @@ vi.mock('../scripts/macos-signing-keychain.mjs', () => ({
 }))
 // This test fakes the host platform, so the real probes would report the absent Windows compilers rather than the failure under test.
 vi.mock('../scripts/desktop-toolchain-preflight.ts', () => ({ requireDesktopToolchain: async () => {} }))
+// Commit discovery has separate integration tests and does not affect redaction.
+vi.mock('../scripts/desktop-build-commit.mjs', async importOriginal => ({
+  ...await importOriginal<typeof import('../scripts/desktop-build-commit.mjs')>(),
+  readDesktopBuildCommit: () => ({ commit: '0'.repeat(40), dirty: false }),
+}))
 vi.mock('node:fs', async importOriginal => ({
   ...await importOriginal<typeof import('node:fs')>(),
   rmSync: () => { throw new AggregateError([new Error('credential-sentinel')], 'restore:mac-proxy recovery required') },

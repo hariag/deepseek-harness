@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -40,10 +41,23 @@ describe('desktop build commit', () => {
       .toThrow(/must be 0 or 1/u)
   })
 
-  it('reads the checkout this repository is in', () => {
-    const packaged = readDesktopBuildCommit(join(import.meta.dirname, '..', '..', '..'))
-    expect(packaged.commit).toMatch(/^[0-9a-f]{40}$/u)
-    expect(typeof packaged.dirty).toBe('boolean')
+  it('reads the exact commit and clean, modified and untracked tree states from Git', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-desktop-commit-'))
+    directories.push(directory)
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }).trim()
+    git('init', '-q', '--object-format=sha1')
+    await writeFile(join(directory, 'tracked.txt'), 'initial')
+    git('add', 'tracked.txt')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial')
+    const commit = git('rev-parse', 'HEAD')
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u)
+    expect(readDesktopBuildCommit(directory)).toEqual({ commit, dirty: false })
+
+    await writeFile(join(directory, 'tracked.txt'), 'changed')
+    expect(readDesktopBuildCommit(directory)).toEqual({ commit, dirty: true })
+    git('checkout', '--', 'tracked.txt')
+    await writeFile(join(directory, 'untracked.txt'), 'new')
+    expect(readDesktopBuildCommit(directory)).toEqual({ commit, dirty: true })
   })
 })
 

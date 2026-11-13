@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "@deepseek-ai/cordis": ["../../vendor/cordis/lib/index.js"]
+    }
+  }
+}
