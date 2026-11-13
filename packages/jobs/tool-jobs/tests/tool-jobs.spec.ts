@@ -10,7 +10,7 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { Session } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { bindScopeParent, createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { JobId } from '@deepseek-ai/dsh-jobs'
@@ -85,18 +85,39 @@ interface FakeDelivery {
 async function fakeAgent(ctx: Context, sessionId: string, delivery: FakeDelivery = {}): Promise<Agent> {
   const scopeFiber = ctx.plugin(() => {})
   const id = brandString<SessionId>(sessionId)
-  const agent = {
+  const nextStep: ReturnType<typeof createUserMessage>[] = []
+  const nextTurn: ReturnType<typeof createUserMessage>[] = []
+  const pending = (target: 'next-step' | 'next-turn') => target === 'next-step' ? nextStep : nextTurn
+  const agent: Agent = {
     id,
     ctx: scopeFiber.ctx,
+    options: {},
+    model: { current: () => undefined, select: () => {} },
     inject: delivery.inject ?? (() => {}),
     followup: delivery.followup ?? (() => {}),
+    send() {},
+    steer() {},
+    cancel() {},
+    whenIdle: async () => {},
+    runMaintenance: task => task(new AbortController().signal),
     status: delivery.status ?? 'running',
-    session: { id, header: { version: 0, id, createdAt: 0 } },
-  } as unknown as Agent
-  // Session projections fold the fake Session when a test logs a notice into it.
-  Object.assign(agent.session, { inheritedEventCount: 0, snapshotEvents: () => [] })
-  const nextStep: ReturnType<typeof createUserMessage>[] = []
-  Object.assign(agent, { inbox: { nextStep, nextTurn: [], remove: delivery.remove ?? (() => true) } })
+    session: Session.create(id),
+    inbox: {
+      nextStep, nextTurn,
+      clear() { nextStep.length = 0; nextTurn.length = 0 },
+      append(target, message) { pending(target).push(message) },
+      prepend(target, message) { pending(target).unshift(message) },
+      replace(messageId, message) {
+        for (const list of [nextStep, nextTurn]) {
+          const index = list.findIndex(item => item.id === messageId)
+          if (index >= 0) { list[index] = message; return true }
+        }
+        return false
+      },
+      remove: delivery.remove ?? (() => true),
+      splice(target, start, deleteCount, inserted) { return pending(target).splice(start, deleteCount, ...inserted) },
+    },
+  }
   fakeInboxes.set(agent, nextStep)
   agentRegistryDisposers.set(agent, await ctx.agents.register(agent))
   agentScopeFibers.set(agent, scopeFiber)
@@ -1300,7 +1321,8 @@ describe('completion notice output', () => {
 
   /** Report the notice as logged into the owner's Session, the point it reaches the model. */
   function logged(ctx: Context, owner: Agent, message: UserMessage): void {
-    ctx.emit('session/event', owner.session, { type: 'user/message', seq: 1, time: 0, data: message } as SessionEvent)
+    const event = owner.session.append('user/message', message, { surfaceOp: 'append' })
+    ctx.emit('session/event', owner.session, event)
   }
 
   it('carries unread output that fits, and the read is spent once the notice is logged', async () => {
@@ -1452,7 +1474,8 @@ describe('completion notice output', () => {
     logged(ctx, other, notice(inject))
     logged(ctx, owner, createUserMessage({ content: [{ type: 'text', text: 'x' }], source: { kind: 'tool-jobs', form: 'notice', summary: 'x' } }))
     logged(ctx, owner, createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
-    ctx.emit('session/event', owner.session, { type: 'turn/start', seq: 2, time: 0, data: { turn: 1 } } as SessionEvent)
+    const turn = owner.session.append('turn/start', { turn: 1 })
+    ctx.emit('session/event', owner.session, turn)
     expect(text(await call(ctx, 'job_output', { job_id: id }, owner))).toBe('kept\n[status: completed]')
   })
 

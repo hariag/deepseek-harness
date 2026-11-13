@@ -6,6 +6,8 @@ The **durability seam** for the event log. [session.md](session.md) describes th
 
 The seam is a [capability seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.md): one abstract service ([dsh-session-persistence](../../packages/session/session-persistence), `ctx.sessionPersistence`) exposing `create`/`open`/`stat`/`list` over the existing `SessionEvent` — **no parallel persisted event type** — where `create` and `open` return a per-session `SessionHandle` (`read`/`append`/`flush`/`close`) that carries all log access and single-writer ownership. The repository ships [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) as its provider; out-of-tree providers may implement the same service contract. See the [handle-based persistence Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.md) and the [session-persistence reference](../../packages/session/session-persistence/README.md).
 
+`SessionLiveEventReceipt` confirms that one observed live event reached its original writer. It does not authorize execution or prove a business action completed. `SessionWriteOpenValidationResult` reports the result of a scoped operation and whether it validated a write open.
+
 ## `SessionHandle` — one open channel onto a stored session
 
 Every log read and write flows through a handle, never through id-addressed service methods: the handle is the single door the cross-process write lease guards. A read returns a caller-owned outer slice and the producer-established aliasing state of its event values. One handle type serves both accesses — a mutation on a `read` handle is a runtime `SessionReadOnlyError` rather than a typed split — and in-process single-writer ownership makes a second `open(id, 'write')` reject with `SessionAlreadyOwnedError` while an owner is active.
@@ -418,6 +420,30 @@ abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistence
 abstract flush(): Promise<void>
 
 /**
+ * Validate every write open performed within one asynchronous operation,
+ * after taking the writer lease and before any migration or repair writes.
+ * An open returns its original handle only after validation succeeds. A
+ * backend without this capability must reject without running the operation.
+ * @param _validate - checks an exclusively leased immutable event snapshot.
+ * @param _operation - calls the legacy consumer that opens the writer.
+ * @returns the operation result and whether a write open was validated.
+ */
+withWriteOpenValidation<T>( _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>, _operation: () => Promise<T>, ): Promise<SessionWriteOpenValidationResult<T>>
+
+/**
+ * Start observing a single live event type on the current session writer.
+ * Unsupported backends and missing writers reject before an input is sent.
+ * Dispose the receipt when finished; the writer may bound its observation
+ * window and may disappear during confirmation. A confirmed event is durable,
+ * but this API does not gate execution or establish business completion.
+ * Rejection after the event was emitted means its outcome is unknown.
+ * @param _id - the live session's id.
+ * @param _type - the event type to observe.
+ * @returns a scoped confirmation handle.
+ */
+beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt
+
+/**
  * Observe one stored session without reading its event log or taking
  * ownership.
  *
@@ -441,7 +467,7 @@ abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<S
 abstract list(options?: SessionPersistenceListOptions): Promise<readonly SessionPersistenceSnapshot[]>
 ```
 
-Types: [SessionId](core.md)
+Types: [SessionEvent](session.md) · [SessionId](core.md)
 
 Source: [`packages/session/session-persistence/src/index.ts`](../../packages/session/session-persistence/src/index.ts)
 <!-- END GENERATED cordis-surface -->

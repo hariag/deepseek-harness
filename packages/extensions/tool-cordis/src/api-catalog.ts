@@ -265,6 +265,24 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'Agent service (`ctx.agents`): tracks live agents and carries the initiating Agent through one process-local asynchronous driver chain. Agent *creation* is provided by whichever plugin implements the AgentFactory (`@deepseek-ai/dsh-agent-loop`), registered via setFactory.\n\nInitiator methods provide same-process causal attribution only. Ambient presence is neither liveness proof nor authorization; subjects and owners remain explicit, as does identity at worker, process, persistence, and wire boundaries. Returned Promise boundaries drain during teardown, except a nested lineage that starts an owning-fiber unload is excluded from its own drain.',
     methods: [
       {
+        signature: 'guardedAdmissionsOf(session: Session): GuardedAdmissionProjection',
+        description: 'Read the current durable guarded admissions without scanning Session history.',
+        parameters: [{ name: 'session', description: 'the Session whose projection is required.' }],
+        returns: 'the current admission identities and durable states.',
+      },
+      {
+        signature: 'guardedAdmissionRecordsOf(session: Session): readonly GuardedAdmissionRecord[]',
+        description: 'Enumerate current guarded identities without exposing mutable internal state.',
+        parameters: [{ name: 'session', description: 'the Session whose projection is required.' }],
+        returns: 'a fresh array of immutable admission records.',
+      },
+      {
+        signature: 'validateGuardedAdmissionHistory(events: readonly SessionEvent[]): void',
+        description: 'Validate admission transitions in an exclusively leased event snapshot before repair writes.',
+        parameters: [{ name: 'events', description: 'the complete leased Session event snapshot.' }],
+        throws: ['if an admission identity or transition is invalid.'],
+      },
+      {
         signature: 'turnBoundaryOf(session: Session): TurnBoundaryProjection',
         description: 'Read the turn and step positions recorded in a Session.',
         parameters: [{ name: 'session', description: 'Session whose committed events are read.' }],
@@ -303,6 +321,18 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Register the agent-creation factory (the loop calls this on construction, effect-scoped). A traced Cordis service is canonicalized to its concrete target; each create/resume call is then traced through that caller\'s context so ownership follows the caller without stacking proxy layers. Throws if a factory is already registered. Returns the disposer; on dispose the factory slot is cleared.',
         parameters: [{ name: 'factory', description: 'the loop-owned factory {@link create}/{@link resume} delegate to.' }],
         returns: 'the disposer that clears the factory slot. The exact Cordis effect disposer (single-shot): composite (generator) effects may yield it directly — exact identity nests the teardown in order.',
+      },
+      {
+        signature: 'async registerGuardedClaimProvider(provider: GuardedClaimProvider): Promise<() => void>',
+        description: 'Install one trusted host provider and bind every currently idle Agent under maintenance before enabling future publication. A busy or unsupported Agent, failed preparation, duplicate provider, or owner disposal rejects registration and rolls back all bindings. Guarded work on partially bound Agents waits until the entire registration commits. New Agent publication waits for this barrier; factories that do not declare its support are rejected while a provider is installed.\n\nThe provider is trusted host code. It may return `undefined` only after checking its own journal for pending work targeting the Agent; the registry additionally refuses that result for any guarded Session history. Before registering, the host must own and fence the journal and resolve or hold uncertain earlier claims. Each coordinator must revalidate authority at the synchronous claim transaction. The owner must stop dispatch and drain in-flight claims before disposing the returned registration.',
+        parameters: [{ name: 'provider', description: 'prepares the coordinator after the host has fenced its journal; honor its abort signal.' }],
+        returns: 'the owner-scoped registration disposer.',
+      },
+      {
+        signature: 'async prepareGuardedClaimProvider(agent: Agent, signal: AbortSignal): Promise<() => () => void>',
+        description: 'Prepare the registered host authority before a factory publishes an Agent. The factory must invoke the returned synchronous commit immediately before registry entry and retain its disposer through Agent teardown.',
+        parameters: [{ name: 'agent', description: 'the unpublished Agent to protect.' }, { name: 'signal', description: 'cancellation of this publication attempt.' }],
+        returns: 'a synchronous publication commit that yields the binding disposer.',
       },
       {
         signature: 'async create(options: CreateAgentOptions): Promise<AgentHandle>',
@@ -3188,6 +3218,18 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         throws: ['{AggregateError} naming each session whose flush failed; the remaining handles still flush.'],
       },
       {
+        signature: 'withWriteOpenValidation<T>( _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>, _operation: () => Promise<T>, ): Promise<SessionWriteOpenValidationResult<T>>',
+        description: 'Validate every write open performed within one asynchronous operation, after taking the writer lease and before any migration or repair writes. An open returns its original handle only after validation succeeds. A backend without this capability must reject without running the operation.',
+        parameters: [{ name: '_validate', description: 'checks an exclusively leased immutable event snapshot.' }, { name: '_operation', description: 'calls the legacy consumer that opens the writer.' }],
+        returns: 'the operation result and whether a write open was validated.',
+      },
+      {
+        signature: 'beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt',
+        description: 'Start observing a single live event type on the current session writer. Unsupported backends and missing writers reject before an input is sent. Dispose the receipt when finished; the writer may bound its observation window and may disappear during confirmation. A confirmed event is durable, but this API does not gate execution or establish business completion. Rejection after the event was emitted means its outcome is unknown.',
+        parameters: [{ name: '_id', description: 'the live session\'s id.' }, { name: '_type', description: 'the event type to observe.' }],
+        returns: 'a scoped confirmation handle.',
+      },
+      {
         signature: 'abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined>',
         description: 'Observe one stored session without reading its event log or taking ownership.\n\nThe snapshot\'s `revision` is an opaque change token comparable only against revisions from the same service instance and session id: equal revisions may be treated as an unchanged log; unequal revisions promise nothing. Write-ownership churn does not change a revision. It exists for derived read-model caches keyed off `stat`/`list`; it plays no part in open, read, or resume.',
         parameters: [{ name: 'id', description: 'the stored session to observe.' }, { name: 'options', description: 'optional cancellation.' }],
@@ -3281,9 +3323,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'checkpoint(session: Session): ProjectionCheckpoint',
-        description: 'State-level checkpoint of every persisted unit for one session, read from the watermark cache (missing cells fold lazily over the in-memory log). This is the write side of the persisted projection cache: the returned rows are the `(key → {ver, seq, val})` part of the durable `(sessionId, key, ver, seq, val)` rows. Every `val` is a DETACHED structured clone — never the live cell reference: the watermark cache is this registry\'s authoritative mutable state, and a caller reaching the live reference could corrupt every subsequent snapshot and frame through it (plain JSON by the unit contract, so the clone is total). A released unit contributes the Session\'s last cell. The registry no longer advances that cell, while a retained handle read still advances it forward, so a writer running after a plugin unloads keeps that unit\'s latest state; a Session that has no cell of it gets no row. restore folds only live units, so its refreshed rows omit released units.',
+        description: 'State-level checkpoint of every cacheable unit for one session, read from the watermark cache (missing cells fold lazily over the in-memory log). This is the write side of the persisted projection cache: the returned rows are the `(key → {ver, seq, val})` part of the durable `(sessionId, key, ver, seq, val)` rows. Every `val` is a DETACHED structured clone — never the live cell reference: the watermark cache is this registry\'s authoritative mutable state, and a caller reaching the live reference could corrupt every subsequent snapshot and frame through it (plain JSON by the unit contract, so the clone is total). A released unit contributes the Session\'s last cell. The registry no longer advances that cell, while a retained handle read still advances it forward, so a writer running after a plugin unloads keeps that unit\'s latest state; a Session that has no cell of it gets no row. restore folds only live units, so its refreshed rows omit released units.',
         parameters: [{ name: 'session', description: 'the session whose unit states are checkpointed.' }],
-        returns: 'one row per registered key, plus one per released key with a cell for this Session.',
+        returns: 'one row per cacheable registered key, plus one per released key with a cell for this Session.',
       },
       {
         signature: 'restoreFloor(checkpoint: ProjectionCheckpoint): SessionLogOffset | undefined',
@@ -5968,7 +6010,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'AgentFactory',
-    declaration: 'export interface AgentFactory {\n    createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle>;\n    resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle>;\n}',
+    declaration: 'export interface AgentFactory {\n    readonly durableAdmissionVersion?: 1;\n    readonly guardedProviderVersion?: 1;\n    createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle>;\n    resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle>;\n}',
   },
   {
     name: 'AgentHandle',
@@ -6836,7 +6878,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'FiberState',
-    declaration: 'export const enum FiberState {\n    PENDING,\n    LOADING,\n    ACTIVE,\n    FAILED,\n    DISPOSED,\n    UNLOADING\n}',
+    declaration: 'export enum FiberState {\n    PENDING,\n    LOADING,\n    ACTIVE,\n    FAILED,\n    DISPOSED,\n    UNLOADING\n}',
   },
   {
     name: 'FileAttachmentRef',
@@ -7279,6 +7321,26 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface GrantRecord {\n    readonly kind: \'grant\';\n    readonly payload: unknown;\n}',
   },
   {
+    name: 'GuardedAdmissionProjection',
+    declaration: 'export interface GuardedAdmissionProjection {\n    readonly root: IndexNode | null;\n}',
+  },
+  {
+    name: 'GuardedAdmissionRecord',
+    declaration: 'export interface GuardedAdmissionRecord {\n    readonly messageId: string;\n    readonly admissionId: string;\n    readonly held: boolean;\n    readonly canceled: boolean;\n}',
+  },
+  {
+    name: 'GuardedClaimCoordinator',
+    declaration: 'export type GuardedClaimCoordinator = (sessionId: string, inputs: readonly GuardedClaimInput[], claim: () => void) => \'committed\';',
+  },
+  {
+    name: 'GuardedClaimInput',
+    declaration: 'export interface GuardedClaimInput {\n    readonly admissionId: string;\n    readonly message: UserMessage;\n    readonly target: InboxTarget;\n}',
+  },
+  {
+    name: 'GuardedClaimProvider',
+    declaration: 'export type GuardedClaimProvider = (agent: Agent, signal: AbortSignal) => GuardedClaimCoordinator | undefined | Promise<GuardedClaimCoordinator | undefined>;',
+  },
+  {
     name: 'HarnessError',
     declaration: 'export class HarnessError extends Error {\n    readonly code: string;\n    constructor(message: string, code: string, options?: ErrorOptions);\n}',
   },
@@ -7341,6 +7403,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ImageVariantId',
     declaration: 'export type ImageVariantId = Branded<\'ImageVariantId\'>;',
+  },
+  {
+    name: 'InboxTarget',
+    declaration: 'export type InboxTarget = \'next-turn\' | \'next-step\';',
   },
   {
     name: 'IncompatiblePlugin',
@@ -8384,7 +8450,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ProjectionDefinition',
-    declaration: 'export interface ProjectionDefinition<K extends string, S> {\n    key: K;\n    stateSchema: ZodType<S>;\n    init(header: SessionHeader, inheritedEventCount: SessionLogOffset): NoInfer<S>;\n    apply(state: NoInfer<S>, event: SessionEvent): NoInfer<S>;\n    wire?: K extends keyof SessionProjectionMap ? {\n        viewSchema: ZodType<SessionProjectionViewValue<SessionProjectionMap[K]>>;\n        view(state: NoInfer<S>): SessionProjectionViewValue<SessionProjectionMap[K]>;\n        summary?: boolean;\n    } : never;\n    stateVersion: number;\n}',
+    declaration: 'export interface ProjectionDefinition<K extends string, S> {\n    key: K;\n    stateSchema: ZodType<S>;\n    init(header: SessionHeader, inheritedEventCount: SessionLogOffset): NoInfer<S>;\n    apply(state: NoInfer<S>, event: SessionEvent): NoInfer<S>;\n    wire?: K extends keyof SessionProjectionMap ? {\n        viewSchema: ZodType<SessionProjectionViewValue<SessionProjectionMap[K]>>;\n        view(state: NoInfer<S>): SessionProjectionViewValue<SessionProjectionMap[K]>;\n        summary?: boolean;\n    } : never;\n    stateVersion: number;\n    replayOnHydrate?: true;\n}',
   },
   {
     name: 'ProjectionEventChangeListener',
@@ -8936,7 +9002,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'Session',
-    declaration: 'export class Session {\n    get surface(): SessionSurface;\n    readonly header: SessionHeader;\n    readonly inheritedEventCount: SessionLogOffset;\n    get id(): SessionId;\n    readonly firstLiveSeq: SessionLogOffset;\n    readonly firstLifecycleSeq: SessionLogOffset;\n    static create(id: SessionId, seed?: readonly SessionEvent[], header?: SessionHeader, inheritedEventCount?: SessionLogOffset, projections?: readonly SessionMessageProjection[]): Session;\n    static fromRestore(id: SessionId, seed: readonly SessionEvent[], header: SessionHeader, inheritedEventCount: SessionLogOffset, eventState: SessionSeedEventState, projections?: readonly SessionMessageProjection[]): Session;\n    eventAt(seq: SessionSeq): SessionEvent | undefined;\n    snapshotEvents(fromSeq: SessionLogOffset = SessionLogOffset(0), toSeqExclusive: SessionLogOffset = this.seq): readonly SessionEvent[];\n    ownEvents(): readonly SessionEvent[];\n    isOwnSeq(seq: SessionSeq): boolean;\n    get seq(): SessionLogOffset;\n    get currentBatchPublication(): SessionEvent | undefined;\n    append(inputs: readonly SessionEventInput[]): readonly SessionEvent[];\n    append<T extends SessionEventType>(type: T, data: SessionEventMap[T], ...opts: T extends SurfaceEventType ? [\n        opts: SurfaceIntent<T>\n    ] : [\n    ]): SessionEvent<T>;\n    requestHeader(): EpochHeader | undefined;\n    requestContext(): RequestContext | undefined;\n    toolHistory(): ToolHistory;\n    deriveMessages(): Message[];\n    deriveEventMessage(event:  /* …truncated — full shape in source */',
+    declaration: 'export class Session {\n    registerAppendGuard(guard: (events: readonly SessionEvent[]) => void): () => void;\n    get surface(): SessionSurface;\n    readonly header: SessionHeader;\n    readonly inheritedEventCount: SessionLogOffset;\n    get id(): SessionId;\n    readonly firstLiveSeq: SessionLogOffset;\n    readonly firstLifecycleSeq: SessionLogOffset;\n    static create(id: SessionId, seed?: readonly SessionEvent[], header?: SessionHeader, inheritedEventCount?: SessionLogOffset, projections?: readonly SessionMessageProjection[]): Session;\n    static fromRestore(id: SessionId, seed: readonly SessionEvent[], header: SessionHeader, inheritedEventCount: SessionLogOffset, eventState: SessionSeedEventState, projections?: readonly SessionMessageProjection[]): Session;\n    eventAt(seq: SessionSeq): SessionEvent | undefined;\n    snapshotEvents(fromSeq: SessionLogOffset = SessionLogOffset(0), toSeqExclusive: SessionLogOffset = this.seq): readonly SessionEvent[];\n    ownEvents(): readonly SessionEvent[];\n    isOwnSeq(seq: SessionSeq): boolean;\n    get seq(): SessionLogOffset;\n    get currentBatchPublication(): SessionEvent | undefined;\n    append(inputs: readonly SessionEventInput[]): readonly SessionEvent[];\n    append<T extends SessionEventType>(type: T, data: SessionEventMap[T], ...opts: T extends SurfaceEventType ? [\n        opts: SurfaceIntent<T>\n    ] : [\n    ]): SessionEvent<T>;\n    requestHeader(): EpochHeader | undefined;\n    requestContext(): RequestContext | undefined;\n    tool /* …truncated — full shape in source */',
   },
   {
     name: 'SessionAccess',
@@ -9197,6 +9263,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionListValue',
     declaration: 'export interface SessionListValue {\n    readonly items: readonly SessionSummary[];\n}',
+  },
+  {
+    name: 'SessionLiveEventReceipt',
+    declaration: 'export interface SessionLiveEventReceipt {\n    confirm(event: SessionEvent): Promise<void>;\n    dispose(): void;\n}',
   },
   {
     name: 'SessionLocation',
@@ -9589,6 +9659,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionWorkspacePathApplication',
     declaration: 'export type SessionWorkspacePathApplication = NativeFileApplication;',
+  },
+  {
+    name: 'SessionWriteOpenValidationResult',
+    declaration: 'export interface SessionWriteOpenValidationResult<T> {\n    readonly value: T;\n    readonly validated: boolean;\n}',
   },
   {
     name: 'SetRelayRequest',

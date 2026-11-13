@@ -18,7 +18,7 @@ import SessionStore, { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
 import ApprovalService, { setApprovalPolicy, type ApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
-import type { Session, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import { SessionQueryError } from '@deepseek-ai/dsh-session-query'
 import { AgentModel, modelSelectionProjectionDefinition } from '@deepseek-ai/dsh-agent'
 import { createInboxStub, provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -136,6 +136,10 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
   run(): Promise<{ code: number; out: string; err: string; order: string[] }>
 }> {
   const ctx = new Context()
+  // The in-memory fixture models a single scoped write-open. Production
+  // backends must validate under their actual exclusive writer lease.
+  let validateOpen: ((id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>) | undefined
+  let validatedOpen = false
   if (options.additionalWritableRoots !== undefined
     || options.startupPermissionMode !== undefined || options.startupApprovalPolicy !== undefined) {
     ctx.provide('headlessStartup', {
@@ -213,6 +217,10 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
     async resume(ownerCtx: Context, resumeOptions: ResumeAgentOptions): Promise<AgentHandle> {
       const session = ctx.sessions.get(resumeOptions.resumeSessionId)
       if (session === undefined) throw new Error(`no attached Session ${resumeOptions.resumeSessionId}`)
+      if (validateOpen !== undefined) {
+        await validateOpen(session.id, session.header, session.snapshotEvents())
+        validatedOpen = true
+      }
       const agent = await mount(ownerCtx, session, resumeOptions)
       return { agent, dispose: () => Promise.resolve() }
     },
@@ -222,7 +230,17 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
     ctx.provide('sessionQuery', { observeSession: () => observe() } as never)
   }
   if (options.omitPersistence !== true) {
-    ctx.provide('sessionPersistence', {} as never)
+    ctx.provide('sessionPersistence', {
+      async withWriteOpenValidation<T>(validate: NonNullable<typeof validateOpen>, operation: () => Promise<T>) {
+        if (validateOpen !== undefined) throw new Error('nested fixture validation is unsupported')
+        validateOpen = validate
+        validatedOpen = false
+        try {
+          const value = await operation()
+          return { value, validated: validatedOpen }
+        } finally { validateOpen = undefined }
+      },
+    } as never)
   }
   return {
     ctx,

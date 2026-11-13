@@ -1,0 +1,8 @@
+version: 1
+scenario: guarded-recovery
+profile: sdk
+composition: sdk-guarded-recovery
+recording: authored
+header:
+  class: sdk-guarded-recovery
+  pin: true

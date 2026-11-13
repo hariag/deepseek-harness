@@ -187,6 +187,24 @@ export type AssistantStreamFrame =
       | { readonly kind: 'abandoned' }
   }
 
+/** One guarded input proposed in a single inbox claim batch. */
+export interface GuardedClaimInput {
+  readonly admissionId: string
+  readonly message: UserMessage
+  readonly target: InboxTarget
+}
+
+/**
+ * Trusted synchronous task authority. It must validate the entire batch and
+ * commit its fenced transaction before returning `committed`. It calls `claim`
+ * exactly once inside that transaction. Failure after claim is outcome-unknown.
+ */
+export type GuardedClaimCoordinator = (
+  sessionId: string,
+  inputs: readonly GuardedClaimInput[],
+  claim: () => void,
+) => 'committed'
+
 declare module './types.ts' {
   interface Agent {
     /** Route fallback and output controls; live accessors apply until the Session records a selection or request. */
@@ -201,11 +219,14 @@ declare module './types.ts' {
     readonly status: AgentStatus
     /** Agent-scoped context; its contributions are agent-local, unwind on disposal, and reject registration afterward. */
     readonly ctx: Context
+    /** Capability declaration: this provider enforces required durable pre-claim admission. */
+    readonly durableAdmissionVersion?: 1
 
     /**
    * Clear queued and steering work — unless `keepInbox` — and abort the active
    * turn or between-turn task. The first cause wins for that activity. With no
    * active activity, cancellation is a no-op and does not arm later work.
+   * Guarded input stays parked until its authority durably reconciles cancellation.
    * Queue-write failures still abort the activity and propagate to the caller.
    * @param cause - the stable caller intent carried by the active operation signal.
    * @param options - cancellation options; `keepInbox` preserves pending work.
@@ -243,6 +264,68 @@ declare module './types.ts' {
    * @param wakeup - whether delivery may wake the driver.
    */
     send(message: UserMessage, target: InboxTarget, wakeup: boolean): void
+
+    /**
+     * Admit one input behind the durable pre-claim gate. The caller must first
+     * persist the original task intent and message identity. Rejection after
+     * submission means the outcome is unknown and must be reconciled. A guarded
+     * input keeps its exact target; if cancellation would redirect it, delivery
+     * rejects instead. Each guarded input owns its own turn; a turn-stopping
+     * listener may still steer that same turn to continue.
+     * @param message - stable identified input.
+     * @param target - the exact inbox boundary.
+     * @param admissionId - stable unique identity for this logical admission.
+     * @returns when the input and gate release have been durably confirmed.
+     */
+    guardedSend?(message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+    /**
+     * Install the trusted synchronous decision authority before guarded delivery.
+     * Only one coordinator can be installed at a time. The returned disposer
+     * removes this exact installation; it cannot clear a later replacement.
+     * Binding wakes pending guarded input without adding another message.
+     * @param coordinator - batch authorization and fenced claim transaction.
+     * @param ready - optional host registration barrier; guarded work waits for it before entering a turn or claiming.
+     * @returns an idempotent disposer for this installation.
+     */
+    setGuardedClaimCoordinator?(coordinator: GuardedClaimCoordinator, ready?: Promise<void>): () => void
+
+    /**
+     * Reconcile an exact recovered input without deciding task authorization.
+     * The installed coordinator still authorizes every eventual claim.
+     * @param sessionId - expected target Session id.
+     * @param message - original complete input.
+     * @param target - original inbox boundary.
+     * @param admissionId - original admission identity.
+     * @returns when the exact stored input is held behind the claim coordinator.
+     */
+    reconcileGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+    /**
+     * Persist a cancellation tombstone and remove the exact pending input.
+     * The task authority must durably record cancellation before this call.
+     * @param sessionId - expected target Session id.
+     * @param message - original complete input.
+     * @param target - original inbox boundary.
+     * @param admissionId - original admission identity.
+     * @returns after cancellation and removal events have exact writer receipts.
+     */
+    cancelGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+    /**
+     * Inspect one exact admission in the stored session without granting execution.
+     * The result describes an observed log prefix, not a current authorization,
+     * execution outcome, or guarantee that the observed prefix was flushed.
+     * @param sessionId - expected target Session id.
+     * @param message - original complete message.
+     * @param target - original inbox boundary.
+     * @param admissionId - original admission identity.
+     * @returns unknown, optionally with a matching pending-log observation.
+     */
+    inspectGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<{
+      decision: 'unknown'
+      observed?: { pending: true; admission: 'held' | 'released' | 'canceled' }
+    }>
 
     /**
    * Queue an ordinary follow-up turn and wake the driver. The item becomes the

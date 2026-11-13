@@ -7,6 +7,7 @@
  */
 
 import { Context, type Fiber } from '@deepseek-ai/cordis'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import z from '@deepseek-ai/schemastery'
 import {
   createSessionFormatCatalogWithChildren,
@@ -29,7 +30,8 @@ import {
   type SessionHandleReadResult,
   type SessionLocation, type SessionPersistenceCreateOptions,
   type SessionPersistenceListOptions, type SessionPersistenceOpenOptions,
-  type SessionPersistenceSnapshot, type SessionPersistenceStatOptions,
+  type SessionPersistenceSnapshot, type SessionPersistenceStatOptions, type SessionLiveEventReceipt,
+  type SessionWriteOpenValidationResult,
   type SessionPersistenceRevision as PersistenceRevision,
 } from '@deepseek-ai/dsh-session-persistence'
 import { JsonlBackendTracker, JsonlSessionHandle, type StorageHandleState } from './storage.ts'
@@ -314,6 +316,25 @@ class JsonlSessionPersistence extends SessionPersistence {
   /** Backend label for diagnostics and effects; shadows `Service.name` without changing the service key. */
   override readonly name = 'session-persistence-jsonl'
 
+  private readonly writeOpenValidation = new AsyncLocalStorage<{
+    validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>
+    active: boolean
+    validated: boolean
+    inFlight: number
+  }>()
+
+  override async withWriteOpenValidation<T>(
+    validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>,
+    operation: () => Promise<T>,
+  ): Promise<SessionWriteOpenValidationResult<T>> {
+    if (this.writeOpenValidation.getStore() !== undefined) throw new Error('nested write-open validation is not allowed')
+    const scope = { validate, active: true, validated: false, inFlight: 0 }
+    try {
+      const value = await this.writeOpenValidation.run(scope, operation)
+      return { value, validated: scope.validated && scope.inFlight === 0 }
+    } finally { scope.active = false }
+  }
+
   private root: string
   private compression: JsonlCompression
   /**
@@ -421,6 +442,19 @@ class JsonlSessionPersistence extends SessionPersistence {
    * @returns the open handle.
    */
   async open(id: SessionId, access: SessionAccess, options?: SessionPersistenceOpenOptions): Promise<SessionHandle> {
+    const scope = access === 'write' ? this.writeOpenValidation.getStore() : undefined
+    if (scope !== undefined && !scope.active) throw new Error('write-open validation scope is closed')
+    if (scope !== undefined) scope.inFlight++
+    try { return await this.openUnvalidated(id, access, options, scope) }
+    finally { if (scope !== undefined) scope.inFlight-- }
+  }
+
+  private async openUnvalidated(
+    id: SessionId,
+    access: SessionAccess,
+    options: SessionPersistenceOpenOptions | undefined,
+    scope: ReturnType<typeof this.writeOpenValidation.getStore>,
+  ): Promise<SessionHandle> {
     options?.signal?.throwIfAborted()
     await this.ensureRootEncoding()
     options?.signal?.throwIfAborted()
@@ -463,6 +497,12 @@ class JsonlSessionPersistence extends SessionPersistence {
       lease = await this.acquireLease(id, undefined, dirname(resolved.currentPath))
       const prepared = await this.requireStoredLog(id, options?.signal)
       options?.signal?.throwIfAborted()
+      if (scope !== undefined) {
+        if (!scope.active) throw new Error('write-open validation scope ended before validation')
+        await scope.validate(id, prepared.meta, prepared.events)
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- the validation scope can close across the await.
+        if (!scope.active) throw new Error('write-open validation scope ended before open')
+      }
       let stored: CurrentStoredLog
       if (prepared.status === 'prepared') {
         stored = await this.publishStoredMigration(id, prepared)
@@ -470,14 +510,17 @@ class JsonlSessionPersistence extends SessionPersistence {
         stored = prepared
       }
       options?.signal?.throwIfAborted()
-      return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, 'write', {
+      if (scope !== undefined && !scope.active) throw new Error('write-open validation scope ended before handle adoption')
+      const handle = this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, 'write', {
         cursor: stored.events.length,
         materialized: true,
         tornTruncateTo: stored.tornTruncateTo,
         recoveredTail: stored.recoveredTail,
         inheritedEventCount: stored.inheritedEventCount,
         primed: stored,
-      }, lease))
+      }, lease, scope?.validate))
+      if (scope !== undefined) scope.validated = true
+      return handle
     } catch (error) {
       // Free the in-process claim no matter how the kernel-lock release
       // fares, and keep the original diagnostic: a release failure joins it
@@ -506,6 +549,11 @@ class JsonlSessionPersistence extends SessionPersistence {
    */
   flush(): Promise<void> {
     return this.tracker.flushAll()
+  }
+
+  /** Start an observation against the session's current writer. */
+  override beginLiveEventReceipt(id: SessionId, type: string): SessionLiveEventReceipt {
+    return this.tracker.beginLiveEventReceipt(id, type)
   }
 
   /**

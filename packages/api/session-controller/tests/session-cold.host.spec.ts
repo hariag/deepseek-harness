@@ -7,7 +7,7 @@ import { AgentModel, modelSelectionProjectionDefinition } from '@deepseek-ai/dsh
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { Context } from '@deepseek-ai/cordis'
 import SessionStore from '@deepseek-ai/dsh-session'
@@ -20,11 +20,14 @@ import { createInboxStub, mountAgentLoopTestDependencies, mountAgentLoopTestHarn
 import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import AttachmentStore from '@deepseek-ai/dsh-attachment'
+import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { SessionPromptRequest, SessionRequestId } from '../src/types.ts'
 import {
   type SessionPersistenceRevision,
   type SessionPersistenceSnapshot,
-  type SessionHandle, SessionAccess,
 } from '@deepseek-ai/dsh-session-persistence'
 import {
   createSessionTestRemote,
@@ -340,7 +343,10 @@ describe('cold history recovery view', () => {
 describe('Remote Agent and Session lookup policy', () => {
   it('resumes a cold session before mutating a restored queue row', async () => {
     const ctx = new Context()
+    const root = await mkdtemp(join(tmpdir(), 'dsh-cold-queue-'))
+    onTestFinished(async () => { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
     await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(Jsonl, { root, compression: 'none' })
     await mountAgentLoopTestHarness(ctx)
     const sessionId = sid('session-cold-queue-mutation')
     const meta = header(sessionId, 1000)
@@ -354,21 +360,9 @@ describe('Remote Agent and Session lookup policy', () => {
       time: 1001,
       data: { target: 'next-turn', start: 0, inserted: [message] },
     }]
-    providePersistence(ctx, {
-      list: () => Promise.resolve([meta]),
-      inspect: () => Promise.resolve({ meta, events }),
-      open: (_id: SessionId, access: SessionAccess): Promise<SessionHandle> => Promise.resolve({
-        id: sessionId,
-        header: meta,
-        inheritedEventCount: SessionLogOffset(0),
-        access,
-        read: () => Promise.resolve({ eventState: 'detached', events: structuredClone(events) }),
-        append: (appended) => { events.push(...appended); return Promise.resolve() },
-        flush: () => Promise.resolve(),
-        close: () => Promise.resolve(),
-        [Symbol.asyncDispose]: () => Promise.resolve(),
-      }),
-    })
+    const writer = await ctx.sessionPersistence.create(meta)
+    await writer.append(events)
+    await writer.close()
     const resume = vi.spyOn(ctx.agents, 'resume')
     const remote = await createSessionTestRemote(ctx, {
       defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
@@ -389,7 +383,6 @@ describe('Remote Agent and Session lookup policy', () => {
       type: 'agent/inbox/spliced',
       data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' },
     })
-    await ctx.fiber.dispose()
   })
 
   it('keeps queue-item-not-found for a cold session when no persistence backend is composed', async () => {

@@ -6,6 +6,8 @@
 
 该 seam 是一个[能力 seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.zh.md)：一个抽象服务（[dsh-session-persistence](../../packages/session/session-persistence)，`ctx.sessionPersistence`）在现有 `SessionEvent` 上暴露 `create`/`open`/`stat`/`list`——**没有平行的持久化事件类型**——其中 `create` 与 `open` 返回逐会话的 `SessionHandle`（`read`/`append`/`flush`/`close`），它承载全部日志访问与单写者所有权。仓库随产品交付 [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) 作为其 provider；仓库外 provider 可以实现同一服务约定。见[基于句柄的持久化 Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.zh.md)与 [session-persistence reference](../../packages/session/session-persistence/README.zh.md)。
 
+`SessionLiveEventReceipt` 确认观察到的实时事件已到达原写入者；它不授权执行，也不证明业务操作完成。`SessionWriteOpenValidationResult` 返回受限操作的结果及是否验证过写入打开。
+
 ## `SessionHandle`——通向已存储会话的一条打开通道
 
 每一次日志读写都经由句柄流动，绝不经由按 id 寻址的服务方法：句柄是跨进程写租约把守的唯一入口。读取会返回调用方独占的外层 slice，以及由生产者建立的 event value 别名状态。一种句柄类型同时服务两种访问——在 `read` 句柄上执行修改是运行时的 `SessionReadOnlyError`，而非类型层面的拆分——而进程内单写者所有权使得在已有活跃持有者时第二次 `open(id, 'write')` 以 `SessionAlreadyOwnedError` 拒绝。
@@ -418,6 +420,30 @@ abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistence
 abstract flush(): Promise<void>
 
 /**
+ * Validate every write open performed within one asynchronous operation,
+ * after taking the writer lease and before any migration or repair writes.
+ * An open returns its original handle only after validation succeeds. A
+ * backend without this capability must reject without running the operation.
+ * @param _validate - checks an exclusively leased immutable event snapshot.
+ * @param _operation - calls the legacy consumer that opens the writer.
+ * @returns the operation result and whether a write open was validated.
+ */
+withWriteOpenValidation<T>( _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>, _operation: () => Promise<T>, ): Promise<SessionWriteOpenValidationResult<T>>
+
+/**
+ * Start observing a single live event type on the current session writer.
+ * Unsupported backends and missing writers reject before an input is sent.
+ * Dispose the receipt when finished; the writer may bound its observation
+ * window and may disappear during confirmation. A confirmed event is durable,
+ * but this API does not gate execution or establish business completion.
+ * Rejection after the event was emitted means its outcome is unknown.
+ * @param _id - the live session's id.
+ * @param _type - the event type to observe.
+ * @returns a scoped confirmation handle.
+ */
+beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt
+
+/**
  * Observe one stored session without reading its event log or taking
  * ownership.
  *
@@ -441,7 +467,7 @@ abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<S
 abstract list(options?: SessionPersistenceListOptions): Promise<readonly SessionPersistenceSnapshot[]>
 ```
 
-Types: [SessionId](core.zh.md)
+Types: [SessionEvent](session.zh.md) · [SessionId](core.zh.md)
 
 Source: [`packages/session/session-persistence/src/index.ts`](../../packages/session/session-persistence/src/index.ts)
 <!-- END GENERATED cordis-surface -->

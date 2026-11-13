@@ -50,6 +50,10 @@ interface AgentHandle {
 
 `AgentFactory` is the creation interface behind the registry: the loop registers its factory via `ctx.agents.setFactory()`, so consumers use `ctx.agents` without depending on the concrete loop package. The registry passes creation options and the caller Context to the factory; the caller Context owns the returned handle's lifetime. The exact `create`/`resume` signatures and rollback contracts are in the [generated section](#ctxagents--agentregistry) below.
 
+`GuardedAdmissionProjection` is the host-only, immutable identity index reconstructed from authoritative Session events. It is not seeded from disposable projection caches.
+
+`GuardedClaimProvider` is the trusted host callback that prepares a coordinator for an Agent, or returns `undefined` only when the host's journal has no pending work for that Agent. Registration fences publication and rejects skipping guarded Session history. The host owns its journal lease, revalidates each claim, and drains in-flight work before unregistering; see [guarded admission compatibility](../persistence-changes/2026-11-13-guarded-admission.md#compatibility).
+
 ## The agent handle
 
 `Agent` is the surface every plugin (UI, hooks, orchestrators) programs against; `ctx.agents.get(id)` returns it, and the [initiator scope](#initiating-agent) carries it. The concrete implementation is package-internal to dsh-agent-loop; nothing outside the loop depends on it. The unified `send` method exposes target and wakeup routing directly; `followup`, `steer`, and `inject` are fixed-preset aliases.
@@ -73,73 +77,138 @@ interface Agent {
   readonly status: AgentStatus
   /** Agent-scoped context; its contributions are agent-local, unwind on disposal, and reject registration afterward. */
   readonly ctx: Context
+  /** Capability declaration: this provider enforces required durable pre-claim admission. */
+  readonly durableAdmissionVersion?: 1
 
   /**
-   * Clear queued and steering work — unless `keepInbox` — and abort the active
-   * turn or between-turn task. The first cause wins for that activity. With no
-   * active activity, cancellation is a no-op and does not arm later work.
-   * Queue-write failures still abort the activity and propagate to the caller.
-   * @param cause - the stable caller intent carried by the active operation signal.
-   * @param options - cancellation options; `keepInbox` preserves pending work.
-   */
+ * Clear queued and steering work — unless `keepInbox` — and abort the active
+ * turn or between-turn task. The first cause wins for that activity. With no
+ * active activity, cancellation is a no-op and does not arm later work.
+ * Guarded input stays parked until its authority durably reconciles cancellation.
+ * Queue-write failures still abort the activity and propagate to the caller.
+ * @param cause - the stable caller intent carried by the active operation signal.
+ * @param options - cancellation options; `keepInbox` preserves pending work.
+ */
   cancel(cause: AgentCancelCause, options?: CancelOptions): void
 
   /**
-   * Resolve after the current whole-agent activity reaches quiescence. This
-   * follows replacement work started before the observed driver retires,
-   * but does not identify the settlement of any particular message.
-   * @returns fulfillment after no active driver or maintenance task remains.
-   */
+ * Resolve after the current whole-agent activity reaches quiescence. This
+ * follows replacement work started before the observed driver retires,
+ * but does not identify the settlement of any particular message.
+ * @returns fulfillment after no active driver or maintenance task remains.
+ */
   whenIdle(): Promise<void>
 
   /**
-   * Run one non-turn maintenance task from the true idle phase. The task starts
-   * synchronously after claiming that phase; later waking input remains in the
-   * inbox until the task settles, while public status stays `idle`.
-   * `whenIdle()` follows both the task and any waking work released behind it.
-   * @param task - operation whose fulfillment or rejection is preserved, with a signal aborted by {@link cancel}.
-   * @throws synchronously when turn-driving or another maintenance task already owns the agent.
-   * @returns the task promise.
-   */
+ * Run one non-turn maintenance task from the true idle phase. The task starts
+ * synchronously after claiming that phase; later waking input remains in the
+ * inbox until the task settles, while public status stays `idle`.
+ * `whenIdle()` follows both the task and any waking work released behind it.
+ * @param task - operation whose fulfillment or rejection is preserved, with a signal aborted by {@link cancel}.
+ * @throws synchronously when turn-driving or another maintenance task already owns the agent.
+ * @returns the task promise.
+ */
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>
 
   /**
-   * Route identified input to an inbox boundary and optionally wake the driver.
-   * Waking input submitted after active cancellation is queued for the next
-   * turn and runs when the aborted activity converges to idle; a `disposed`
-   * cancel leaves it parked. A wake submitted while already idle always opens
-   * its turn boundary, even when its message is cleared before the driver
-   * claims ([driver wake convergence](../../agent-loop/src/agent.ts)).
-   * @param message - identified content and the source that supplied it.
-   * @param target - the preferred next-turn or next-step inbox boundary.
-   * @param wakeup - whether delivery may wake the driver.
-   */
+ * Route identified input to an inbox boundary and optionally wake the driver.
+ * Waking input submitted after active cancellation is queued for the next
+ * turn and runs when the aborted activity converges to idle; a `disposed`
+ * cancel leaves it parked. A wake submitted while already idle always opens
+ * its turn boundary, even when its message is cleared before the driver
+ * claims ([driver wake convergence](../../agent-loop/src/agent.ts)).
+ * @param message - identified content and the source that supplied it.
+ * @param target - the preferred next-turn or next-step inbox boundary.
+ * @param wakeup - whether delivery may wake the driver.
+ */
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void
 
   /**
-   * Queue an ordinary follow-up turn and wake the driver. The item becomes the
-   * sole ordinary message of its own turn.
-   * @param message - identified prompt content and the source that supplied it.
+   * Admit one input behind the durable pre-claim gate. The caller must first
+   * persist the original task intent and message identity. Rejection after
+   * submission means the outcome is unknown and must be reconciled. A guarded
+   * input keeps its exact target; if cancellation would redirect it, delivery
+   * rejects instead. Each guarded input owns its own turn; a turn-stopping
+   * listener may still steer that same turn to continue.
+   * @param message - stable identified input.
+   * @param target - the exact inbox boundary.
+   * @param admissionId - stable unique identity for this logical admission.
+   * @returns when the input and gate release have been durably confirmed.
    */
+  guardedSend?(message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+  /**
+   * Install the trusted synchronous decision authority before guarded delivery.
+   * Only one coordinator can be installed at a time. The returned disposer
+   * removes this exact installation; it cannot clear a later replacement.
+   * Binding wakes pending guarded input without adding another message.
+   * @param coordinator - batch authorization and fenced claim transaction.
+   * @param ready - optional host registration barrier; guarded work waits for it before entering a turn or claiming.
+   * @returns an idempotent disposer for this installation.
+   */
+  setGuardedClaimCoordinator?(coordinator: GuardedClaimCoordinator, ready?: Promise<void>): () => void
+
+  /**
+   * Reconcile an exact recovered input without deciding task authorization.
+   * The installed coordinator still authorizes every eventual claim.
+   * @param sessionId - expected target Session id.
+   * @param message - original complete input.
+   * @param target - original inbox boundary.
+   * @param admissionId - original admission identity.
+   * @returns when the exact stored input is held behind the claim coordinator.
+   */
+  reconcileGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+  /**
+   * Persist a cancellation tombstone and remove the exact pending input.
+   * The task authority must durably record cancellation before this call.
+   * @param sessionId - expected target Session id.
+   * @param message - original complete input.
+   * @param target - original inbox boundary.
+   * @param admissionId - original admission identity.
+   * @returns after cancellation and removal events have exact writer receipts.
+   */
+  cancelGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void>
+
+  /**
+   * Inspect one exact admission in the stored session without granting execution.
+   * The result describes an observed log prefix, not a current authorization,
+   * execution outcome, or guarantee that the observed prefix was flushed.
+   * @param sessionId - expected target Session id.
+   * @param message - original complete message.
+   * @param target - original inbox boundary.
+   * @param admissionId - original admission identity.
+   * @returns unknown, optionally with a matching pending-log observation.
+   */
+  inspectGuardedAdmission?(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<{
+    decision: 'unknown'
+    observed?: { pending: true; admission: 'held' | 'released' | 'canceled' }
+  }>
+
+  /**
+ * Queue an ordinary follow-up turn and wake the driver. The item becomes the
+ * sole ordinary message of its own turn.
+ * @param message - identified prompt content and the source that supplied it.
+ */
   followup(message: UserMessage): void
 
   /**
-   * Submit steering for the nearest step. An idle driver starts a turn;
-   * a running driver consumes it at its next step boundary.
-   * A rejected step leaves steering parked in the inbox until the next
-   * wake; cancellation or disposal may discard pending steering.
-   * @param message - identified steering content and the source that supplied it.
-   */
+ * Submit steering for the nearest step. An idle driver starts a turn;
+ * a running driver consumes it at its next step boundary.
+ * A rejected step leaves steering parked in the inbox until the next
+ * wake; cancellation or disposal may discard pending steering.
+ * @param message - identified steering content and the source that supplied it.
+ */
   steer(message: UserMessage): void
 
   /**
-   * Queue model-facing context for the next pre-step without waking the
-   * driver. A running driver claims it at the nearest later step boundary;
-   * idle drivers leave it pending until follow-up or steering
-   * wakes them. It may miss a request whose pre-step already claimed its
-   * batch. Cancellation or disposal may discard pending context.
-   * @param message - identified injected context and the source that supplied it.
-   */
+ * Queue model-facing context for the next pre-step without waking the
+ * driver. A running driver claims it at the nearest later step boundary;
+ * idle drivers leave it pending until follow-up or steering
+ * wakes them. It may miss a request whose pre-step already claimed its
+ * batch. Cancellation or disposal may discard pending context.
+ * @param message - identified injected context and the source that supplied it.
+ */
   inject(message: UserMessage): void
 }
 ```
@@ -689,6 +758,27 @@ Initiator methods provide same-process causal attribution only. Ambient presence
 
 ```ts cordis-catalog
 /**
+ * Read the current durable guarded admissions without scanning Session history.
+ * @param session - the Session whose projection is required.
+ * @returns the current admission identities and durable states.
+ */
+guardedAdmissionsOf(session: Session): GuardedAdmissionProjection
+
+/**
+ * Enumerate current guarded identities without exposing mutable internal state.
+ * @param session - the Session whose projection is required.
+ * @returns a fresh array of immutable admission records.
+ */
+guardedAdmissionRecordsOf(session: Session): readonly GuardedAdmissionRecord[]
+
+/**
+ * Validate admission transitions in an exclusively leased event snapshot before repair writes.
+ * @param events - the complete leased Session event snapshot.
+ * @throws if an admission identity or transition is invalid.
+ */
+validateGuardedAdmissionHistory(events: readonly SessionEvent[]): void
+
+/**
  * Read the turn and step positions recorded in a Session.
  * @param session - Session whose committed events are read.
  * @returns the current turn and step positions; do not mutate the returned value.
@@ -758,6 +848,37 @@ withoutInitiator<T>(operation: () => T): T
  *   yield it directly — exact identity nests the teardown in order.
  */
 setFactory(factory: AgentFactory): () => void
+
+/**
+ * Install one trusted host provider and bind every currently idle Agent under
+ * maintenance before enabling future publication. A busy or unsupported
+ * Agent, failed preparation, duplicate provider, or owner disposal rejects
+ * registration and rolls back all bindings. Guarded work on partially bound
+ * Agents waits until the entire registration commits. New Agent publication
+ * waits for this barrier; factories that do not declare its support are
+ * rejected while a provider is installed.
+ *
+ * The provider is trusted host code. It may return `undefined` only after
+ * checking its own journal for pending work targeting the Agent; the
+ * registry additionally refuses that result for any guarded Session history.
+ * Before registering, the host must own and fence the journal and resolve or
+ * hold uncertain earlier claims. Each coordinator must revalidate authority
+ * at the synchronous claim transaction. The owner must stop dispatch and
+ * drain in-flight claims before disposing the returned registration.
+ * @param provider - prepares the coordinator after the host has fenced its journal; honor its abort signal.
+ * @returns the owner-scoped registration disposer.
+ */
+async registerGuardedClaimProvider(provider: GuardedClaimProvider): Promise<() => void>
+
+/**
+ * Prepare the registered host authority before a factory publishes an Agent.
+ * The factory must invoke the returned synchronous commit immediately before
+ * registry entry and retain its disposer through Agent teardown.
+ * @param agent - the unpublished Agent to protect.
+ * @param signal - cancellation of this publication attempt.
+ * @returns a synchronous publication commit that yields the binding disposer.
+ */
+async prepareGuardedClaimProvider(agent: Agent, signal: AbortSignal): Promise<() => () => void>
 
 /**
  * Create and publish a new agent through the registered factory.
@@ -839,7 +960,7 @@ get(id: SessionId): Agent | undefined
 list(): Agent[]
 ```
 
-Types: [Session](session.md)
+Types: [Session](session.md) · [SessionEvent](session.md)
 
 Source: [`packages/core/agent/src/index.ts`](../../packages/core/agent/src/index.ts)
 

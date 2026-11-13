@@ -66,6 +66,7 @@ import {
 } from '@deepseek-ai/dsh-sdk-client'
 import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import { deriveReplayScript, parseSessionLog } from '@deepseek-ai/dsh-llm-replay'
+import { expectedPlatformOutput } from '../../scripts/sdk-landlock-output.js'
 
 const corpusRoot = fileURLToPath(new URL('../', import.meta.url))
 
@@ -809,7 +810,9 @@ async function runScenario(scenario: CorpusScenario): Promise<{
   const recordedActions = sdkActions(primaryFixture, assertions.replayStandaloneCommands === true)
   const actions = scenario.name === 'serial-created'
     ? recordedActions.filter(action => action.kind === 'turn' && action.content !== undefined)
-    : recordedActions
+    : scenario.name === 'guarded-recovery'
+      ? recordedActions.map((action, index) => index === 0 && action.kind === 'turn' ? { kind: 'turn' as const, turn: action.turn } : action)
+      : recordedActions
   const resumeReplayFile = scenario.name === 'session-resume' && !recording
     ? join(patchRoot, 'resume-replay.json') : undefined
   const prepareTurnReplay = async (turn: number): Promise<void> => {
@@ -828,6 +831,7 @@ async function runScenario(scenario: CorpusScenario): Promise<{
     DSH_SNAPSHOT_MODEL: route.model,
     DSH_TELEMETRY_DISABLED: '1',
     DSH_AGENTS_HOME: join(cwd, '.agents'),
+    ...scenario.name === 'guarded-recovery' ? { DSH_GUARDED_SNAPSHOT_JOURNAL: join(dshHome, 'guarded-sdk-test-journal.json') } : {},
     NODE_OPTIONS: [process.env.NODE_OPTIONS, '--disable-warning=ExperimentalWarning'].filter(Boolean).join(' '),
     ...parentFixture === undefined ? {} : {
       DSH_SNAPSHOT_FILE: parentFixture,
@@ -907,6 +911,15 @@ async function runScenario(scenario: CorpusScenario): Promise<{
     }
     try {
       let session = harness.session(sessionId)
+      if (scenario.name === 'guarded-recovery') {
+        await session.getWorkingDirectory()
+        subscription.close()
+        await harness.close()
+        harness = createHarness()
+        await harness.start()
+        subscription = harness.client.subscribeSessionTree(sessionId)
+        session = await harness.resumeSession(sessionId)
+      }
       for (const action of actions) {
         if (action.kind === 'command') {
           const execution = await session.run(assertions.commandAttachments === true ? [
@@ -940,7 +953,7 @@ async function runScenario(scenario: CorpusScenario): Promise<{
             event => event.type === 'turn/end' && (event.data as JsonObject | undefined)?.turn === action.turn,
             (notification) => {
               observe(notification)
-              if (assertions.replayStandaloneCommands === true) notifications.push(notification)
+              if (assertions.replayStandaloneCommands === true || scenario.name === 'guarded-recovery') notifications.push(notification)
             },
           )
           continue
@@ -1682,7 +1695,44 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
       const expectedContext = contextOfContents(expectedContents)
       const actualSnapshots = normalizeSessionSnapshots(ordered.map(log => log.content), actualContext, { nativeWriterOutput: true })
       const expectedSnapshots = normalizeSessionSnapshots(expectedContents, expectedContext, { nativeWriterOutput: true })
-      expect(actualSnapshots.map(records), `${scenario.name}: sessions`).toEqual(expectedSnapshots.map(records))
+      if (process.env.DSH_TEST_EXPECT_PARTIAL_LANDLOCK === '1' && ['background-wait-steer', 'bash-tool'].includes(scenario.name)) {
+        expect(expectedPlatformOutput(expectedSnapshots[0]!, actualSnapshots[0]!, scenario.name),
+          `${scenario.name}: expected the exact partial Landlock warning in the real tool output`).not.toBe(expectedSnapshots[0])
+      }
+      expect(actualSnapshots.map(records), `${scenario.name}: sessions`).toEqual(expectedSnapshots.map((expected, index) =>
+        records(expectedPlatformOutput(expected, actualSnapshots[index]!, scenario.name))))
+      if (scenario.name === 'guarded-recovery') {
+        const events = records(ordered[0]!.content)
+        const admission = (type: string): number[] => events.flatMap((event, index) => {
+          const data = event.data as JsonObject | undefined
+          return event.type === type && data?.admissionId === 'guarded-sdk-admission' ? [index] : []
+        })
+        const held = admission('agent/admission/hold')
+        const released = admission('agent/admission/release')
+        const reconciled = admission('agent/admission/reconciled')
+        const guardedInsertions = events.flatMap((event, index) => {
+          const data = event.data as JsonObject | undefined
+          const inserted = data?.inserted
+          return event.type === 'agent/inbox/spliced' && data?.target === 'next-turn' && Array.isArray(inserted)
+            && inserted.some(message => (message as JsonObject).id === 'guarded-sdk-message') ? [index] : []
+        })
+        const guardedMessages = events.flatMap((event, index) => event.type === 'user/message'
+          && (event.data as JsonObject | undefined)?.id === 'guarded-sdk-message' ? [index] : [])
+        const ordinaryMessages = events.flatMap((event, index) => event.type === 'user/message'
+          && ((event.data as JsonObject | undefined)?.source as JsonObject | undefined)?.kind === 'user' ? [index] : [])
+        expect(held).toHaveLength(1)
+        expect(released).toHaveLength(1)
+        expect(reconciled).toHaveLength(1)
+        expect(guardedInsertions).toHaveLength(1)
+        expect(guardedMessages).toHaveLength(1)
+        expect(ordinaryMessages).toHaveLength(1)
+        expect(held[0]!).toBeLessThan(released[0]!)
+        expect(held[0]!).toBeLessThan(guardedInsertions[0]!)
+        expect(guardedInsertions[0]!).toBeLessThan(released[0]!)
+        expect(released[0]!).toBeLessThan(reconciled[0]!)
+        expect(reconciled[0]!).toBeLessThan(guardedMessages[0]!)
+        expect(guardedMessages[0]!).toBeLessThan(ordinaryMessages[0]!)
+      }
       await verifyHeaders(scenario, ordered, actualContext, assertions.dshSdkChild?.agentConfig)
 
       // Genuine SDK protocol cases retain their secondary wire projections.
@@ -1700,8 +1750,8 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
           notificationComparisonRecords(normalizedNotifications, ordered.map(log => log.content)),
           `${scenario.name}: notifications`,
         )
-          .toEqual(notificationComparisonRecords(expectedNotifications, expectedContents))
-        expect(normalizedResult).toBe(await readFile(resultExpectedPath, 'utf8'))
+          .toEqual(notificationComparisonRecords(expectedPlatformOutput(expectedNotifications, normalizedNotifications, scenario.name), expectedContents))
+        expect(normalizedResult).toBe(expectedPlatformOutput(await readFile(resultExpectedPath, 'utf8'), normalizedResult, scenario.name))
       }
 
       if (scenario.name === 'system-prompt-in-history') {

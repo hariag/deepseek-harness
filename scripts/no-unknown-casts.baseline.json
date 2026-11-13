@@ -1219,7 +1219,6 @@
     "64ab5463fdb068e88a33f022baff473b7a0da77854c4ecf8e26412763d6dccf6": 1
   },
   "packages/jobs/tool-jobs/tests/tool-jobs.spec.ts": {
-    "0683cfd7f792f1b6333bc8c419d8ce32a7a630179280a31083a8f664e26e0ec0": 1,
     "52faf4558fcd91bd27dbdfa7e497843e8eeb75ea5f68ee231335018d5b3f2053": 2
   },
   "packages/llm/deepseek-llm-api-extensions/src/index.ts": {
@@ -1281,8 +1280,7 @@
   },
   "packages/llm/plugin-package-inventory-deepseek/tests/inventory.spec.ts": {
     "52d2065a82de4056b5e5d9ae80a45002dc100a8ce5f0434f73f099dc2bc2427f": 1,
-    "9f6156b070f787b60db69ad515eec1a0fc8ecbbe3742ec5c2c1e109df7992f62": 2,
-    "d80d9fb673065fb4761f9c832abd280ed22b8825c65027bb24ca3d70601223ee": 2
+    "9f6156b070f787b60db69ad515eec1a0fc8ecbbe3742ec5c2c1e109df7992f62": 2
   },
   "packages/llm/token-meter/src/index.ts": {
     "3df219493866b820bfcb24557fc4b067accff5bae81d87ffd15845a748b4e42a": 1
@@ -1599,18 +1597,10 @@
     "59c63f734e8bba862325f776e3fcbebd78a84cfb4161f8df41c216950d9bf351": 1
   },
   "packages/shell/tool-bash/tests/tools.spec.ts": {
-    "41338a90589ac4c3f04beabf90e520ebf5ea48cd02afd96ccf8ad48dccce120f": 1,
-    "48ae3a6867271a1591bfb51f2707502c2eb515e998a557be49030db67ba41cd4": 1,
-    "5c0beb58563a1b35284f952551e508b73d1644ce50c23e270e6a0bbec398cf07": 1,
     "ccb0925e3e1d693b0cf9be6216198f915310da30548609cb81aa7e4246c1246a": 1
   },
   "packages/shell/tool-pwsh-persistent/tests/loader-composition.spec.ts": {
     "59c63f734e8bba862325f776e3fcbebd78a84cfb4161f8df41c216950d9bf351": 1
-  },
-  "packages/shell/tool-pwsh/tests/tools.spec.ts": {
-    "3923b6d0f0da525911b77d50d8cf81fc8d5ea805090cb6e46876f27216dd6a65": 1,
-    "5cedcf47f5df159bc794dc2adf05d8b8eeccc56b14993d2fb505b127627c5742": 1,
-    "73c54fafe9b5e31d842b420a12bc4188fae6e222bfb64d6e204172f324c34356": 1
   },
   "packages/skill/skill/tests/skill.spec.ts": {
     "0166546b07456dbfb8e79af5fd97d72bf4ed2cbe6f6847c06f169967d53d7d9a": 2,

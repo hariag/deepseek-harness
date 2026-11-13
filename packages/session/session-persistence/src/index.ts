@@ -67,6 +67,24 @@ export interface SessionPersistenceSnapshot {
   readonly location?: SessionLocation
 }
 
+/** A bounded, live-only observation used to confirm one exact event. */
+export interface SessionLiveEventReceipt {
+  /**
+   * Confirm an exact event observed after the receipt was opened.
+   * @param event - the event to confirm against the original session writer.
+   * @returns when that event is durably stored.
+   */
+  confirm(event: SessionEvent): Promise<void>
+  /** Release the observation. A released receipt cannot confirm an event. */
+  dispose(): void
+}
+
+/** The result of one scoped write-open validation operation. */
+export interface SessionWriteOpenValidationResult<T> {
+  readonly value: T
+  readonly validated: boolean
+}
+
 /** Options for {@link SessionPersistence.create}. */
 export interface SessionPersistenceCreateOptions {
   /** Optional cancellation observed before backend work starts. */
@@ -185,6 +203,37 @@ export abstract class SessionPersistence extends Service {
    *   remaining handles still flush.
    */
   abstract flush(): Promise<void>
+
+  /**
+   * Validate every write open performed within one asynchronous operation,
+   * after taking the writer lease and before any migration or repair writes.
+   * An open returns its original handle only after validation succeeds. A
+   * backend without this capability must reject without running the operation.
+   * @param _validate - checks an exclusively leased immutable event snapshot.
+   * @param _operation - calls the legacy consumer that opens the writer.
+   * @returns the operation result and whether a write open was validated.
+   */
+  withWriteOpenValidation<T>(
+    _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>,
+    _operation: () => Promise<T>,
+  ): Promise<SessionWriteOpenValidationResult<T>> {
+    return Promise.reject(new Error('Scoped write-open validation is unsupported by this persistence backend'))
+  }
+
+  /**
+   * Start observing a single live event type on the current session writer.
+   * Unsupported backends and missing writers reject before an input is sent.
+   * Dispose the receipt when finished; the writer may bound its observation
+   * window and may disappear during confirmation. A confirmed event is durable,
+   * but this API does not gate execution or establish business completion.
+   * Rejection after the event was emitted means its outcome is unknown.
+   * @param _id - the live session's id.
+   * @param _type - the event type to observe.
+   * @returns a scoped confirmation handle.
+   */
+  beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt {
+    throw new Error('Live event receipts are unsupported by this persistence backend')
+  }
 
   /**
    * Observe one stored session without reading its event log or taking

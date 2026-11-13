@@ -102,6 +102,14 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
+    /** Required durable hold that prevents the driver from claiming one input. */
+    'agent/admission/hold': { messageId: string; admissionId: string }
+    /** Required durable release of a matching admission hold. */
+    'agent/admission/release': { messageId: string; admissionId: string }
+    /** Required cancellation of a guarded input. */
+    'agent/admission/cancel': { messageId: string; admissionId: string }
+    /** Confirms the released admission prefix before recovery can revalidate it. */
+    'agent/admission/reconciled': { messageId: string; admissionId: string }
     /**
      * One normalized mutation of an agent's durable pending-message lists.
      * The session-projection registry applies the committed event before

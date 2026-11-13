@@ -33,6 +33,8 @@ seam 随产品交付 [JSONL](../session-persistence-jsonl/README.zh.md) 后端�
 
 ### 服务提供什么
 
+`beginLiveEventReceipt(sessionId, type)` 在指定 Session 的当前写入器上开启可选、有界的事件观察。使用实际观察到的完整事件调用 `confirm`，并在结束后释放回执；确认成功只证明该事件已持久化，不表示输入已执行或完成。不支持该能力的后端和缺失写入器会在观察开始前拒绝；事件已发出后确认失败时，其结果仍未知。该 API 不会阻止 Agent 在等待确认期间领取输入。
+
 挂载后端后，五个服务方法寻址已存储会话：
 
 ```text

@@ -23,6 +23,10 @@ The [format references](persistence-changes/historical-formats/README.md) cover 
 | `JsonlHeaderLine` | header | `18ee62b8900a4c3d046700f05d7a4d49d6cab2a660a020c87481d1603dd8bd4f` | [`HeaderLine`](#persistence-type-sha256-18ee62b8900a4c3d046700f05d7a4d49d6cab2a660a020c87481d1603dd8bd4f) |
 | `SessionEventEnvelope` | envelope | `5776e5553ff2dfe3f5bc202dbb1e7c9f93e35a531aebb7764c23b2b6153b2ccc` | [`union (3 variants)`](#persistence-type-sha256-5776e5553ff2dfe3f5bc202dbb1e7c9f93e35a531aebb7764c23b2b6153b2ccc) |
 | `event:agent-preset/selected` | event | `a10c17474eaf2ddab7095a099e0fe3d046fc18e56c3e344fc8894c05ff9ef97b` | [`{ type: "agent-preset/selected" }`](#persistence-type-sha256-a10c17474eaf2ddab7095a099e0fe3d046fc18e56c3e344fc8894c05ff9ef97b) |
+| `event:agent/admission/cancel` | event | `beddf08f4c251fe00bd33763b31d2db7eea3fff7fdc3ff59a72fa293f11cb187` | [`{ type: "agent/admission/cancel" }`](#persistence-type-sha256-beddf08f4c251fe00bd33763b31d2db7eea3fff7fdc3ff59a72fa293f11cb187) |
+| `event:agent/admission/hold` | event | `6c28dac83cdfa5cfdb14fa218ca362312c8bc883cc6b70ac161c01f8d2590a80` | [`{ type: "agent/admission/hold" }`](#persistence-type-sha256-6c28dac83cdfa5cfdb14fa218ca362312c8bc883cc6b70ac161c01f8d2590a80) |
+| `event:agent/admission/reconciled` | event | `6c447256e6ed7acef60b37695d7dbb80d77ee068354d8eb6f97bec6faab22dc3` | [`{ type: "agent/admission/reconciled" }`](#persistence-type-sha256-6c447256e6ed7acef60b37695d7dbb80d77ee068354d8eb6f97bec6faab22dc3) |
+| `event:agent/admission/release` | event | `ab7095e8f3e6ada5c995179895eebb2033575a80990dd1880a1e7d793eb51a23` | [`{ type: "agent/admission/release" }`](#persistence-type-sha256-ab7095e8f3e6ada5c995179895eebb2033575a80990dd1880a1e7d793eb51a23) |
 | `event:agent/inbox/spliced` | event | `f5d843edb0eeef61c9f5328599d5f92b61112b7710b0310b043196b15b390d64` | [`{ type: "agent/inbox/spliced" }`](#persistence-type-sha256-f5d843edb0eeef61c9f5328599d5f92b61112b7710b0310b043196b15b390d64) |
 | `event:approval/asked` | event | `3bfeb47b58606f4661904bc723da612782214c463d01e6d61cd6d6193d7374e1` | [`{ type: "approval/asked" }`](#persistence-type-sha256-3bfeb47b58606f4661904bc723da612782214c463d01e6d61cd6d6193d7374e1) |
 | `event:approval/decided` | event | `bb1ab3d08f49a9f3b265f844cd78d5c49813062a7b34b54904b426f85d0ff6e3` | [`{ type: "approval/decided" }`](#persistence-type-sha256-bb1ab3d08f49a9f3b265f844cd78d5c49813062a7b34b54904b426f85d0ff6e3) |
@@ -167,6 +171,50 @@ Sources: [`packages/core/session/src/types.ts:439`](../packages/core/session/src
 
 ### `agent/*`
 
+<a id="agentadmissioncancel--log-only"></a>
+
+#### `agent/admission/cancel` — log-only
+
+```ts persistence-catalog
+/** Required cancellation of a guarded input. */
+'agent/admission/cancel': { messageId: string; admissionId: string }
+```
+
+Source: [`packages/core/agent/src/types.ts:110`](../packages/core/agent/src/types.ts)
+
+<a id="agentadmissionhold--log-only"></a>
+
+#### `agent/admission/hold` — log-only
+
+```ts persistence-catalog
+/** Required durable hold that prevents the driver from claiming one input. */
+'agent/admission/hold': { messageId: string; admissionId: string }
+```
+
+Source: [`packages/core/agent/src/types.ts:106`](../packages/core/agent/src/types.ts)
+
+<a id="agentadmissionreconciled--log-only"></a>
+
+#### `agent/admission/reconciled` — log-only
+
+```ts persistence-catalog
+/** Confirms the released admission prefix before recovery can revalidate it. */
+'agent/admission/reconciled': { messageId: string; admissionId: string }
+```
+
+Source: [`packages/core/agent/src/types.ts:112`](../packages/core/agent/src/types.ts)
+
+<a id="agentadmissionrelease--log-only"></a>
+
+#### `agent/admission/release` — log-only
+
+```ts persistence-catalog
+/** Required durable release of a matching admission hold. */
+'agent/admission/release': { messageId: string; admissionId: string }
+```
+
+Source: [`packages/core/agent/src/types.ts:108`](../packages/core/agent/src/types.ts)
+
 <a id="agentinboxspliced--log-only"></a>
 
 #### `agent/inbox/spliced` — log-only
@@ -186,7 +234,7 @@ Sources: [`packages/core/session/src/types.ts:439`](../packages/core/session/src
 }
 ```
 
-Source: [`packages/core/agent/src/types.ts:110`](../packages/core/agent/src/types.ts)
+Source: [`packages/core/agent/src/types.ts:118`](../packages/core/agent/src/types.ts)
 
 ### `agent-preset/*`
 
@@ -700,7 +748,7 @@ Source: [`packages/llm/llm-retry/src/types.ts:11`](../packages/llm/llm-retry/src
 'model/selection': ModelSelection
 ```
 
-Source: [`packages/core/agent/src/types.ts:121`](../packages/core/agent/src/types.ts)
+Source: [`packages/core/agent/src/types.ts:129`](../packages/core/agent/src/types.ts)
 
 ### `permission/*`
 
@@ -1407,6 +1455,38 @@ SHA-256: `82470020b5bfcb1a843e2aa05602af7d37df99e82d01f015c7c589ba054fd89d`
 SHA-256: `557e148d30b79ee48645850832b30c717d7c3b64641deb5d6133b8b4e91ee0b8`
 
 `"agent-preset/selected"`
+
+<a id="persistence-type-sha256-57e4951a35e06084f3c07e30ee316523706f172debb76226a164100525afd34c"></a>
+
+### `"agent/admission/cancel"`
+
+SHA-256: `57e4951a35e06084f3c07e30ee316523706f172debb76226a164100525afd34c`
+
+`"agent/admission/cancel"`
+
+<a id="persistence-type-sha256-a7fd2ceb20f56674d7cecf8a2cd0e0126add767b9883843e78a94f7213376d3d"></a>
+
+### `"agent/admission/hold"`
+
+SHA-256: `a7fd2ceb20f56674d7cecf8a2cd0e0126add767b9883843e78a94f7213376d3d`
+
+`"agent/admission/hold"`
+
+<a id="persistence-type-sha256-2d6c153a859841d791e1bc51186d98a32957d8b75a249c1fccd155a76882b8ad"></a>
+
+### `"agent/admission/reconciled"`
+
+SHA-256: `2d6c153a859841d791e1bc51186d98a32957d8b75a249c1fccd155a76882b8ad`
+
+`"agent/admission/reconciled"`
+
+<a id="persistence-type-sha256-8c4170607acbb2748426f55c97362f65db42d76d6c4e1e4ea901965c272f3c65"></a>
+
+### `"agent/admission/release"`
+
+SHA-256: `8c4170607acbb2748426f55c97362f65db42d76d6c4e1e4ea901965c272f3c65`
+
+`"agent/admission/release"`
 
 <a id="persistence-type-sha256-829a2fb3be6efd4ba36aef8ed2d381a4c6fb2a0aaf50c823a6f3f8290786b809"></a>
 
@@ -5883,6 +5963,19 @@ Sources: [`packages/plan/plan-mode/src/index.ts:55`](../packages/plan/plan-mode/
 |---|---|---|
 | `active` | required | `boolean` |
 
+<a id="persistence-type-sha256-7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25"></a>
+
+### `{ admissionId, messageId }`
+
+SHA-256: `7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25`
+
+Sources: [`packages/core/agent/src/types.ts:106`](../packages/core/agent/src/types.ts) · [`packages/core/agent/src/types.ts:108`](../packages/core/agent/src/types.ts) · [`packages/core/agent/src/types.ts:110`](../packages/core/agent/src/types.ts) · [`packages/core/agent/src/types.ts:112`](../packages/core/agent/src/types.ts)
+
+| Property | Presence | Type |
+|---|---|---|
+| `admissionId` | required | `string` |
+| `messageId` | required | `string` |
+
 <a id="persistence-type-sha256-6e52dd55a1d48954ed5464ec46fe34d9eb65f709baabc9561e7a279910b0c406"></a>
 
 ### `{ agentPreset }`
@@ -6542,7 +6635,7 @@ Sources: [`packages/core/session/src/types.ts:435`](../packages/core/session/src
 
 SHA-256: `261128de68865c1f92f2bfa2ccd21f362d6e624cb00fc0cf5558d9d7b82302c5`
 
-Sources: [`packages/core/agent/src/types.ts:110`](../packages/core/agent/src/types.ts)
+Sources: [`packages/core/agent/src/types.ts:118`](../packages/core/agent/src/types.ts)
 
 | Property | Presence | Type |
 |---|---|---|
@@ -8233,6 +8326,70 @@ SHA-256: `a10c17474eaf2ddab7095a099e0fe3d046fc18e56c3e344fc8894c05ff9ef97b`
 | `seq` | required | `number` |
 | `time` | required | `number` |
 | `type` | required | `"agent-preset/selected"` |
+
+<a id="persistence-type-sha256-beddf08f4c251fe00bd33763b31d2db7eea3fff7fdc3ff59a72fa293f11cb187"></a>
+
+<a id="persistence-type-eventagentadmissioncancel"></a>
+
+### `{ type: "agent/admission/cancel" }`
+
+SHA-256: `beddf08f4c251fe00bd33763b31d2db7eea3fff7fdc3ff59a72fa293f11cb187`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`{ admissionId, messageId }`](#persistence-type-sha256-7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"agent/admission/cancel"` |
+
+<a id="persistence-type-sha256-6c28dac83cdfa5cfdb14fa218ca362312c8bc883cc6b70ac161c01f8d2590a80"></a>
+
+<a id="persistence-type-eventagentadmissionhold"></a>
+
+### `{ type: "agent/admission/hold" }`
+
+SHA-256: `6c28dac83cdfa5cfdb14fa218ca362312c8bc883cc6b70ac161c01f8d2590a80`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`{ admissionId, messageId }`](#persistence-type-sha256-7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"agent/admission/hold"` |
+
+<a id="persistence-type-sha256-6c447256e6ed7acef60b37695d7dbb80d77ee068354d8eb6f97bec6faab22dc3"></a>
+
+<a id="persistence-type-eventagentadmissionreconciled"></a>
+
+### `{ type: "agent/admission/reconciled" }`
+
+SHA-256: `6c447256e6ed7acef60b37695d7dbb80d77ee068354d8eb6f97bec6faab22dc3`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`{ admissionId, messageId }`](#persistence-type-sha256-7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"agent/admission/reconciled"` |
+
+<a id="persistence-type-sha256-ab7095e8f3e6ada5c995179895eebb2033575a80990dd1880a1e7d793eb51a23"></a>
+
+<a id="persistence-type-eventagentadmissionrelease"></a>
+
+### `{ type: "agent/admission/release" }`
+
+SHA-256: `ab7095e8f3e6ada5c995179895eebb2033575a80990dd1880a1e7d793eb51a23`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`{ admissionId, messageId }`](#persistence-type-sha256-7cbf9d84e8dec78afbd494495b937522d682d4a4f42fee2d5351bbf11b170a25) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"agent/admission/release"` |
 
 <a id="persistence-type-sha256-f5d843edb0eeef61c9f5328599d5f92b61112b7710b0310b043196b15b390d64"></a>
 

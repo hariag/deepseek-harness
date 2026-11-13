@@ -472,6 +472,13 @@ type SessionEventInput = {
  * @typert object
  */
 declare class Session {
+  /**
+   * Install synchronous pre-commit validation for this Session's lifetime.
+   * The callback must inspect the full proposed batch without side effects.
+   * @param guard - validation invoked before any candidate enters the log.
+   * @returns an idempotent removal callback.
+   */
+  registerAppendGuard(guard: (events: readonly SessionEvent[]) => void): () => void;
   /** The ordered surface over this session's event log. */
   get surface(): SessionSurface;
   /**

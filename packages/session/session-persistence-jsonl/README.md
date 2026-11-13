@@ -29,6 +29,8 @@ Mount this backend when a composition needs durable sessions backed by per-sessi
 
 ### When to choose it
 
+The optional live-event receipt observes only event types requested by active callers; each writer supports at most 128 observations, each retaining at most 128 event digests. Evicted or unobserved events reject conservatively. Receipts do not survive writer replacement and do not gate Agent execution.
+
 Choose this backend when consumers benefit from one artifact per session — navigation, external tooling, or a raw line-readable log. It is the sole first-party Session-persistence provider. The backend keeps sessions under a deployment-controlled root: project-local, shared, temporary, or centralized.
 
 ### Minimal configuration

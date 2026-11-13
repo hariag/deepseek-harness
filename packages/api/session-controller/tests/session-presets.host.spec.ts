@@ -3,6 +3,7 @@
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
@@ -108,11 +109,26 @@ async function harness(options: HarnessOptions = {}) {
     } as never)
   }
   const stored = options.stored ?? new Map<SessionId, StoredSession>()
+  // This in-memory writer double models exclusive ownership and validates the
+  // exact post-observation snapshot inside the active writer lease.
+  const writers = new Set<SessionId>()
+  const validation = new AsyncLocalStorage<{
+    validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>
+    validated: boolean
+  }>()
   ctx.provide('sessionPersistence', testSessionPersistence(ctx, {
     list: () => Promise.resolve([...stored.values()].map(record => record.header)),
     inspect: (id: SessionId) => {
       const record = stored.get(id)
       return Promise.resolve(record === undefined ? undefined : { meta: record.header, events: [...record.events] })
+    },
+    async withWriteOpenValidation<T>(
+      validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>,
+      operation: () => Promise<T>,
+    ) {
+      const scope = { validate, validated: false }
+      const value = await validation.run(scope, operation)
+      return { value, validated: scope.validated }
     },
   }) as never)
   const { members, archived } = options.workspace ?? { members: [], archived: [] }
@@ -160,12 +176,22 @@ async function harness(options: HarnessOptions = {}) {
         await publish(ctx.sessions.prepare(id, { meta: record.header, seed: [...record.events] }), undefined)
         throw Object.assign(new Error(`session "${id}" is written by this process`), { name: 'SessionAlreadyOwnedError' })
       }
-      resumed.push(id)
-      const session = ctx.sessions.prepare(id, {
-        meta: record.header,
-        seed: [...record.events, ...options.writtenSinceObservation?.get(id) ?? []],
-      })
-      return publish(session, resume.setup)
+      if (writers.has(id)) throw Object.assign(new Error(`session "${id}" is already written`), { name: 'SessionAlreadyOwnedError' })
+      writers.add(id)
+      try {
+        const events = [...record.events, ...options.writtenSinceObservation?.get(id) ?? []]
+        const scope = validation.getStore()
+        if (scope === undefined) throw new Error('test writer opened without a validation scope')
+        await scope.validate(id, record.header, events)
+        scope.validated = true
+        resumed.push(id)
+        const session = ctx.sessions.prepare(id, { meta: record.header, seed: events })
+        const handle = await publish(session, resume.setup)
+        return { agent: handle.agent, dispose: async () => { try { await handle.dispose() } finally { writers.delete(id) } } }
+      } catch (error: unknown) {
+        writers.delete(id)
+        throw error
+      }
     },
   }
   ctx.agents.setFactory(factory)

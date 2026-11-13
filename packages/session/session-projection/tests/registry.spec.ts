@@ -73,6 +73,30 @@ const countUnit = (): ProjectionDefinition<'test/count', number> => ({
   stateVersion: 1,
 })
 
+it('replays host-only authority state instead of seeding a live cell from a forged checkpoint', async () => {
+  const { ctx, session } = await harness()
+  const unit = { ...countUnit(), key: 'test/authority', replayOnHydrate: true } as const
+  const handle = await ctx.sessionProjections.register(unit)
+  expect(ctx.sessionProjections.restoreFloor({})).toBeUndefined()
+  await ctx.sessionProjections.register(countUnit())
+  mark(session, ['one'])
+  mark(session, ['two'])
+  const events = session.snapshotEvents()
+  const rows = ctx.sessionProjections.checkpoint(session)
+  expect(rows['test/authority']).toBeUndefined()
+  rows['test/authority'] = { ver: 1, seq: SessionSeq(events.length - 1), val: 0 }
+  expect(ctx.sessionProjections.restoreFloor(rows)).toBe(SessionLogOffset(events.length - 1))
+  const cold = ctx.sessionProjections.restore(
+    rows, events.slice(-1), SessionLogOffset(events.length - 1), session.header, session.inheritedEventCount,
+  )
+  expect(cold.checkpoint['test/authority']).toBeUndefined()
+  const prepared = ctx.sessions.prepare(brandString<SessionId>('authority-hydrate'), { seed: events })
+  ctx.sessionProjections.hydrate(prepared, rows, events, SessionLogOffset(0))
+  expect(handle.stateOf(prepared)).toBe(prepared.snapshotEvents().length)
+  await expect(Promise.resolve(ctx.sessionProjections.register({ ...countUnit(), key: 'test/authority' }))).rejects.toThrow('exclusive owner')
+  await expect(Promise.resolve(ctx.sessionProjections.register({ ...marksUnit(), replayOnHydrate: true }))).rejects.toThrow('cannot expose a wire view')
+})
+
 const stableViewUnit = (
   view: (state: StableViewState) => StableViewState['value'],
 ) => ({

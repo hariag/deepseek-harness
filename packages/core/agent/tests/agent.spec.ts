@@ -2,7 +2,11 @@ import { unsupportedModel } from '@deepseek-ai/dsh-agent-loop-testkit'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { describe, expect, expectTypeOf, it, onTestFinished } from 'vitest'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import { Session, type SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, type SessionId } from '@deepseek-ai/dsh-session'
+import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 
@@ -43,6 +47,40 @@ function stubAgent(rawId: string, overrides: Partial<Agent> = {}): Agent {
 }
 
 describe('AgentRegistry', () => {
+  it('prevents direct registration and legacy factories from bypassing a guarded provider', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    const disposeProvider = await ctx.agents.registerGuardedClaimProvider(() => undefined)
+    const agent = stubAgent('provider-bypass')
+    expect(() => ctx.agents.enter(agent)).toThrow('publication barrier')
+    const disposeAgent = await ctx.agents.register(agent)
+    expect(ctx.agents.get(agent.id)).toBe(agent)
+    await disposeAgent()
+    const factory: AgentFactory = {
+      async createAgent() { throw new Error('must not be called') },
+      async resume() { throw new Error('must not be called') },
+    }
+    const disposeFactory = ctx.agents.setFactory(factory)
+    await expect(ctx.agents.create({ sessionId: agent.id })).rejects.toThrow('publication barrier')
+    await expect(ctx.agents.resume({ resumeSessionId: agent.id })).rejects.toThrow('publication barrier')
+    disposeFactory()
+    disposeProvider()
+  })
+
+  it('rejects writable sessions that cannot enforce the admission guard', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    const session = Session.create(brandString<SessionId>('unguarded'))
+    Object.defineProperty(session, 'registerAppendGuard', { value: undefined })
+    expect(() => ctx.agents.enter(stubAgent('unguarded', { session })))
+      .toThrow('cannot enforce required durable admission')
+    expect(ctx.agents.get(session.id)).toBeUndefined()
+  })
+
   it('waits for its projection owner and reads turn positions without a loop', async () => {
     const ctx = new Context()
     onTestFinished(() => ctx.fiber.dispose())
@@ -302,6 +340,16 @@ describe('explicit cancellation contract', () => {
 })
 
 describe('AgentRegistry factory seam', () => {
+  async function prepareLegacySession(ctx: Context, id: SessionId): Promise<void> {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-agent-factory-'))
+    onTestFinished(async () => { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(Jsonl, { root, compression: 'none' })
+    const handle = await ctx.sessionPersistence.create(Session.create(id).header)
+    await handle.flush()
+    await handle.close()
+  }
+
   function stubFactory() {
     const calls: {
       create: Array<{ ownerCtx: Context; options: CreateAgentOptions }>
@@ -314,7 +362,10 @@ describe('AgentRegistry factory seam', () => {
       },
       async resume(ownerCtx, options) {
         calls.resume.push({ ownerCtx, options })
-        return { agent: stubAgent(options.resumeSessionId), dispose: () => Promise.resolve() }
+        const persistence = ownerCtx.get('sessionPersistence')
+        if (persistence === undefined) throw new Error('session persistence unavailable')
+        const handle = await persistence.open(options.resumeSessionId, 'write')
+        return { agent: stubAgent(options.resumeSessionId), dispose: () => handle.close() }
       },
     }
     return { factory, calls }
@@ -325,6 +376,7 @@ describe('AgentRegistry factory seam', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     await expect(ctx.agents.create({ sessionId: brandString<SessionId>('s') })).rejects.toThrow(/no agent factory/)
+    await prepareLegacySession(ctx, brandString<SessionId>('resume-s'))
     const { factory, calls } = stubFactory()
     ctx.agents.setFactory(factory)
 
@@ -355,6 +407,7 @@ describe('AgentRegistry factory seam', () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
+    await prepareLegacySession(ctx, brandString<SessionId>('resume-s'))
     const states = new WeakMap<object, string[]>()
     class TracedFactory extends Service implements AgentFactory {
       constructor(inner: Context) {
@@ -371,9 +424,12 @@ describe('AgentRegistry factory seam', () => {
         this.calls().push('create')
         return { agent: stubAgent(options.sessionId), dispose: () => Promise.resolve() }
       }
-      async resume(_ownerCtx: Context, options: ResumeAgentOptions) {
+      async resume(ownerCtx: Context, options: ResumeAgentOptions) {
         this.calls().push('resume')
-        return { agent: stubAgent(options.resumeSessionId), dispose: () => Promise.resolve() }
+        const persistence = ownerCtx.get('sessionPersistence')
+        if (persistence === undefined) throw new Error('session persistence unavailable')
+        const handle = await persistence.open(options.resumeSessionId, 'write')
+        return { agent: stubAgent(options.resumeSessionId), dispose: () => handle.close() }
       }
     }
     await ctx.plugin(TracedFactory)

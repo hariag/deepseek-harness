@@ -1,0 +1,14 @@
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    includeDefaultRoots: false
+- id: time-context
+  disabled: true
+- id: session-persistence-jsonl
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js dshHomePath('sessions')
+    compression: none
+- insert:
+    - id: guarded-sdk-test-host
+      name: './runtime.mjs'

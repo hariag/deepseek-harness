@@ -12,17 +12,21 @@ import { isPromise } from 'node:util/types'
 import { scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Session, SessionEvent, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import { installTurnArchiveAdmission } from './archive-admission.ts'
 import type { Agent, TurnBoundaryProjection } from './types.ts'
-import type { AgentOptions, SessionStartSource } from './runtime-types.ts'
+import type { AgentOptions, GuardedClaimCoordinator, SessionStartSource } from './runtime-types.ts'
 import { turnBoundaryProjectionDefinition } from './projection.ts'
+import { guardedAdmissionProjectionDefinition, guardedAdmissionRecords, validateGuardedAdmissionHistory } from './admission-projection.ts'
+import type { GuardedAdmissionProjection, GuardedAdmissionRecord } from './admission-projection.ts'
 
 export * from './runtime-types.ts'
 export * from './types.ts'
 export { AgentModel, modelSelectionProjectionDefinition, installModelSelection } from './model-selection.ts'
 export type { ModelSelectionProjectionState } from './model-selection.ts'
 export type * from './projection.ts'
+export type { GuardedAdmissionProjection, GuardedAdmissionRecord } from './admission-projection.ts'
 export * from './consumed-work.ts'
 export { agentCarrier, agentEvents, assembleContextFor, emitAgentEvent } from './dispatch.ts'
 export type { AgentEventDispatch, AgentSubjectEvent } from './dispatch.ts'
@@ -55,6 +59,32 @@ export type AgentSetup = (
   agentCtx: Context,
   agent: Agent,
 ) => AgentSetupCommit | Promise<AgentSetupCommit | void> | void
+
+/** Trusted host preparation of a guarded claim coordinator for an Agent. */
+export type GuardedClaimProvider = (
+  agent: Agent, signal: AbortSignal,
+) => GuardedClaimCoordinator | undefined | Promise<GuardedClaimCoordinator | undefined>
+
+interface GuardedProviderSlot {
+  readonly provider: GuardedClaimProvider
+  readonly abort: AbortController
+  readonly ready: PromiseWithResolvers<void>
+  readonly bindings: Map<Agent, () => void>
+}
+
+async function awaitGuardedProvider<T>(operation: PromiseLike<T> | T, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  let stop: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- preserve the caller's exact AbortSignal reason.
+    stop = () => { reject(signal.reason) }
+    signal.addEventListener('abort', stop, { once: true })
+    if (signal.aborted) stop()
+  })
+  try { return await Promise.race([operation, aborted]) } finally {
+    if (stop !== undefined) signal.removeEventListener('abort', stop)
+  }
+}
 
 /**
  * Options for programmatically creating an agent through the registry factory
@@ -169,6 +199,10 @@ export interface AgentHandle {
  * depending on the concrete `dsh-agent-loop` package.
  */
 export interface AgentFactory {
+  /** Provider enforces durable pre-claim admission during resume before mutating the log. */
+  readonly durableAdmissionVersion?: 1
+  /** Factory participates in the registry's guarded provider publication barrier. */
+  readonly guardedProviderVersion?: 1
   /**
    * Create a new agent on a caller-supplied session id. Async because creation
    * enters and announces the Session, awaits setup and its optional synchronous commit,
@@ -247,7 +281,10 @@ export class AgentRegistry extends Service {
   static inject = ['sessionProjections']
 
   private turnBoundaryProjectionHandle!: ProjectionHandle<TurnBoundaryProjection>
+  private guardedAdmissionProjectionHandle!: ProjectionHandle<GuardedAdmissionProjection>
   private store = new Map<SessionId, AgentEntry>()
+  private readonly admissionGuardedSessions = new WeakSet<Session>()
+  private guardedProvider: GuardedProviderSlot | undefined
   private factory: FactorySlot | undefined
   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
@@ -290,6 +327,34 @@ export class AgentRegistry extends Service {
 
   protected async [Service.init](): Promise<void> {
     this.turnBoundaryProjectionHandle = await this.ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
+    this.guardedAdmissionProjectionHandle = await this.ctx.sessionProjections.register(guardedAdmissionProjectionDefinition)
+  }
+
+  /**
+   * Read the current durable guarded admissions without scanning Session history.
+   * @param session - the Session whose projection is required.
+   * @returns the current admission identities and durable states.
+   */
+  guardedAdmissionsOf(session: Session): GuardedAdmissionProjection {
+    return this.guardedAdmissionProjectionHandle.stateOf(session)
+  }
+
+  /**
+   * Enumerate current guarded identities without exposing mutable internal state.
+   * @param session - the Session whose projection is required.
+   * @returns a fresh array of immutable admission records.
+   */
+  guardedAdmissionRecordsOf(session: Session): readonly GuardedAdmissionRecord[] {
+    return guardedAdmissionRecords(this.guardedAdmissionsOf(session))
+  }
+
+  /**
+   * Validate admission transitions in an exclusively leased event snapshot before repair writes.
+   * @param events - the complete leased Session event snapshot.
+   * @throws if an admission identity or transition is invalid.
+   */
+  validateGuardedAdmissionHistory(events: readonly SessionEvent[]): void {
+    validateGuardedAdmissionHistory(events)
   }
 
   /**
@@ -392,9 +457,112 @@ export class AgentRegistry extends Service {
     return dispose
   }
 
+  /**
+   * Install one trusted host provider and bind every currently idle Agent under
+   * maintenance before enabling future publication. A busy or unsupported
+   * Agent, failed preparation, duplicate provider, or owner disposal rejects
+   * registration and rolls back all bindings. Guarded work on partially bound
+   * Agents waits until the entire registration commits. New Agent publication
+   * waits for this barrier; factories that do not declare its support are
+   * rejected while a provider is installed.
+   *
+   * The provider is trusted host code. It may return `undefined` only after
+   * checking its own journal for pending work targeting the Agent; the
+   * registry additionally refuses that result for any guarded Session history.
+   * Before registering, the host must own and fence the journal and resolve or
+   * hold uncertain earlier claims. Each coordinator must revalidate authority
+   * at the synchronous claim transaction. The owner must stop dispatch and
+   * drain in-flight claims before disposing the returned registration.
+   * @param provider - prepares the coordinator after the host has fenced its journal; honor its abort signal.
+   * @returns the owner-scoped registration disposer.
+   */
+  async registerGuardedClaimProvider(provider: GuardedClaimProvider): Promise<() => void> {
+    if (typeof provider !== 'function') throw new TypeError('guarded claim provider must be a function')
+    const slot: GuardedProviderSlot = {
+      provider, abort: new AbortController(), ready: Promise.withResolvers<void>(), bindings: new Map(),
+    }
+    void slot.ready.promise.catch(() => {})
+    const dispose = this.ctx.effect(() => {
+      if (this.guardedProvider !== undefined) throw new Error('a guarded claim provider is already registered')
+      this.guardedProvider = slot
+      return () => {
+        slot.abort.abort(new Error('guarded claim provider disposed'))
+        if (this.guardedProvider === slot) this.guardedProvider = undefined
+        for (const release of slot.bindings.values()) release()
+        slot.bindings.clear()
+      }
+    }, 'agents.guardedClaimProvider()')
+    try {
+      for (const agent of this.list()) {
+        await agent.runMaintenance(async (signal) => {
+          const prepare = await this.prepareGuardedClaimProviderForSlot(agent, signal, slot, false)
+          prepare()
+        })
+      }
+      if (this.guardedProvider !== slot || slot.abort.signal.aborted) throw new Error('guarded claim provider disposed during registration')
+      slot.ready.resolve()
+      // oxlint-disable-next-line typescript/no-misused-promises -- preserve the exact owner-scoped Cordis disposer.
+      return dispose
+    } catch (error: unknown) {
+      slot.ready.reject(error)
+      await dispose()
+      throw error
+    }
+  }
+
+  private async prepareGuardedClaimProviderForSlot(
+    agent: Agent, signal: AbortSignal, slot: GuardedProviderSlot, waitReady: boolean,
+  ): Promise<() => () => void> {
+    const combined = AbortSignal.any([signal, slot.abort.signal])
+    if (waitReady) await awaitGuardedProvider(slot.ready.promise, combined)
+    const coordinator = await awaitGuardedProvider(Promise.resolve().then(() => slot.provider(agent, combined)), combined)
+    combined.throwIfAborted()
+    if (coordinator === undefined && this.guardedAdmissionsOf(agent.session).root !== null) {
+      throw new Error(`agent "${agent.id}" has guarded history without a claim coordinator`)
+    }
+    return () => {
+      combined.throwIfAborted()
+      if (this.guardedProvider !== slot || slot.bindings.has(agent)) throw new Error('guarded claim provider changed during Agent publication')
+      let release: () => void = () => {}
+      if (coordinator !== undefined) {
+        if (agent.setGuardedClaimCoordinator === undefined) throw new Error(`agent "${agent.id}" cannot install a guarded claim coordinator`)
+        release = agent.setGuardedClaimCoordinator(coordinator, slot.ready.promise)
+      }
+      let installed = true
+      const remove = (): void => {
+        if (!installed) return
+        installed = false
+        slot.bindings.delete(agent)
+        release()
+      }
+      slot.bindings.set(agent, remove)
+      return remove
+    }
+  }
+
+  /**
+   * Prepare the registered host authority before a factory publishes an Agent.
+   * The factory must invoke the returned synchronous commit immediately before
+   * registry entry and retain its disposer through Agent teardown.
+   * @param agent - the unpublished Agent to protect.
+   * @param signal - cancellation of this publication attempt.
+   * @returns a synchronous publication commit that yields the binding disposer.
+   */
+  async prepareGuardedClaimProvider(agent: Agent, signal: AbortSignal): Promise<() => () => void> {
+    const slot = this.guardedProvider
+    if (slot !== undefined) return this.prepareGuardedClaimProviderForSlot(agent, signal, slot, true)
+    return () => {
+      if (this.guardedProvider !== undefined) throw new Error('guarded claim provider changed during Agent publication')
+      return () => {}
+    }
+  }
+
   /** Return the active creation factory. */
   private requireFactory(): FactorySlot {
     if (this.factory === undefined) throw new Error(NO_FACTORY_MESSAGE)
+    if (this.guardedProvider !== undefined && this.factory.target.guardedProviderVersion !== 1) {
+      throw new Error('agent factory does not support the guarded provider publication barrier')
+    }
     return this.factory
   }
 
@@ -430,8 +598,26 @@ export class AgentRegistry extends Service {
     const ownerCtx = this.ctx
     const { target } = this.requireFactory()
     const receiver = getTraceable(ownerCtx, target)
-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.resume, receiver, [ownerCtx, options])
+    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply explicitly supplies the traced receiver.
+    const resume = (): Promise<AgentHandle> => Reflect.apply(target.resume, receiver, [ownerCtx, options])
+    if (target.durableAdmissionVersion === 1) return resume()
+    const persistence = ownerCtx.get('sessionPersistence')
+    if (persistence === undefined) throw new Error('legacy Agent resume cannot validate required admission')
+    if (typeof persistence.withWriteOpenValidation !== 'function') {
+      throw new Error('legacy Agent resume requires a persistence backend with scoped write-open validation')
+    }
+    const guarded = await persistence.withWriteOpenValidation((id, _header, events) => {
+      if (id !== options.resumeSessionId) throw new Error('legacy Agent attempted to open a different session for write')
+      if (events.some(event => event.type === 'agent/admission/hold'
+        || event.type === 'agent/admission/release' || event.type === 'agent/admission/cancel' || event.type === 'agent/admission/reconciled')) {
+        throw new Error('legacy Agent cannot resume required admission events')
+      }
+    }, resume)
+    if (!guarded.validated) {
+      await guarded.value.dispose()
+      throw new Error('legacy Agent resume did not validate a write handle')
+    }
+    return guarded.value
   }
 
   /**
@@ -454,7 +640,16 @@ export class AgentRegistry extends Service {
    */
   register(agent: Agent): ReturnType<Context['effect']> {
     return this.ctx.effect(async function* (this: AgentRegistry) {
-      yield this.enter(agent)
+      if (this.guardedProvider === undefined) {
+        yield this.enter(agent)
+      } else {
+        const entered = await agent.runMaintenance(async (signal) => {
+          const prepare = await this.prepareGuardedClaimProvider(agent, signal)
+          const release = prepare()
+          try { return { release, detach: this.enter(agent) } } catch (error: unknown) { release(); throw error }
+        })
+        yield () => { entered.detach(); entered.release() }
+      }
       await this.announce(agent, 'startup')
     }.bind(this), 'agents.register()')
   }
@@ -473,8 +668,30 @@ export class AgentRegistry extends Service {
    */
   enter(agent: Agent): () => void {
     const id = agent.id
+    if (this.guardedProvider !== undefined && !this.guardedProvider.bindings.has(agent)) {
+      throw new Error(`agent "${id}" has not passed the guarded provider publication barrier`)
+    }
     if (id !== agent.session.id) {
       throw new Error(`agent id "${id}" does not match session id "${agent.session.id}"`)
+    }
+    const requiresAdmission = (type: string): boolean => type === 'agent/admission/hold'
+      || type === 'agent/admission/release' || type === 'agent/admission/cancel' || type === 'agent/admission/reconciled'
+    if (agent.durableAdmissionVersion !== 1 && this.guardedAdmissionsOf(agent.session).root !== null) {
+      throw new Error(`agent "${id}" cannot resume required durable admission events`)
+    }
+    if (!this.admissionGuardedSessions.has(agent.session)) {
+      const session = agent.session
+      if (typeof session.registerAppendGuard !== 'function') {
+        throw new Error(`agent "${id}" session cannot enforce required durable admission`)
+      }
+      session.registerAppendGuard((events) => {
+        if (!events.some(event => requiresAdmission(event.type))) return
+        const owner = this.store.get(id)?.agent
+        if (owner?.session !== session || owner.durableAdmissionVersion !== 1) {
+          throw new Error(`agent "${id}" does not support required durable admission`)
+        }
+      })
+      this.admissionGuardedSessions.add(session)
     }
     const carrier = scopeTarget(agent, agent)
     // This is the authoritative collision boundary. Concurrent create/resume

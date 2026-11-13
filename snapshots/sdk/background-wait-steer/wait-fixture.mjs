@@ -13,6 +13,7 @@ export const inject = ['jobs', 'tools']
 const STEER_TEXT = 'STEER_WHILE_WAITING'
 const PRODUCER_OUTPUT = 'producer ready'
 const STEERED_RESULT = 'producer ready\n[status: running, user steered]'
+const STEERED_RESULT_WITH_PARTIAL_LANDLOCK = 'producer ready\n[stderr]\nlandlock-run: partial enforcement (older Landlock ABI)\n[status: running, user steered]'
 
 /** @param {import('@deepseek-ai/cordis').Context} ctx - Scenario-owned runtime. */
 export function apply(ctx) {
@@ -76,7 +77,7 @@ export function apply(ctx) {
     if (barrierError !== undefined) throw barrierError
     if (released === undefined) throw new Error('the steered wait returned no result')
     if (released.isError) throw new Error(`the steered wait failed: ${released.text}`)
-    if (released.text !== STEERED_RESULT) throw new Error(`the steered wait returned ${JSON.stringify(released.text)}`)
+    if (released.text !== STEERED_RESULT && released.text !== STEERED_RESULT_WITH_PARTIAL_LANDLOCK) throw new Error(`the steered wait returned ${JSON.stringify(released.text)}`)
     if (released.producer !== 'running') throw new Error('the released wait stopped the producer')
     const input = agent.session.deriveMessages()
       .find(message => message.role === 'user' && JSON.stringify(message.content).includes(STEER_TEXT))

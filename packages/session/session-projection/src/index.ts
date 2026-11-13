@@ -130,6 +130,12 @@ export interface ProjectionDefinition<K extends string, S> {
    * equivalence before retaining a version; schema acceptance alone is insufficient.
    */
   stateVersion: number
+  /**
+   * Exclude this host-only unit from disposable checkpoints and cold restores.
+   * Its first live read folds the Session log; later reads advance that cell.
+   * Use for state whose correctness controls security or task admission.
+   */
+  replayOnHydrate?: true
 }
 
 /**
@@ -223,6 +229,7 @@ interface ErasedDefinition {
     summary: boolean
   } | undefined
   stateVersion: number
+  replayOnHydrate: boolean
 }
 
 /** Per-session per-unit watermark and fixed live-drive view buffer. */
@@ -398,6 +405,10 @@ export class SessionProjectionRegistry extends Service {
         ? undefined
         : { viewSchema: wire.viewSchema, view: state => wire.view(state as S), summary: wire.summary !== false },
       stateVersion: definition.stateVersion,
+      replayOnHydrate: definition.replayOnHydrate === true,
+    }
+    if (erased.replayOnHydrate && erased.wire !== undefined) {
+      throw new Error(`session projection ${JSON.stringify(definition.key)} cannot expose a wire view with replayOnHydrate`)
     }
     if (!Number.isSafeInteger(definition.stateVersion) || definition.stateVersion < 0) {
       throw new Error(`session projection ${JSON.stringify(definition.key)} stateVersion must be a non-negative integer, got ${String(definition.stateVersion)}`)
@@ -411,6 +422,9 @@ export class SessionProjectionRegistry extends Service {
         this.registrations.set(key, registration)
         this.summaryKeySet = undefined
       } else {
+        if (existing.def.replayOnHydrate || erased.replayOnHydrate) {
+          throw new Error(`session projection key ${JSON.stringify(key)} requires an exclusive owner`)
+        }
         if (existing.def.stateVersion !== erased.stateVersion) {
           throw new Error(`session projection key ${JSON.stringify(key)} is already registered at stateVersion ${String(existing.def.stateVersion)}; refusing to share it with stateVersion ${String(erased.stateVersion)}`)
         }
@@ -584,7 +598,7 @@ export class SessionProjectionRegistry extends Service {
   }
 
   /**
-   * State-level checkpoint of every persisted unit for one session, read
+   * State-level checkpoint of every cacheable unit for one session, read
    * from the watermark cache (missing cells fold lazily over the in-memory
    * log). This is the write side of the persisted projection cache: the
    * returned rows are the `(key → {ver, seq, val})` part of the durable
@@ -600,11 +614,12 @@ export class SessionProjectionRegistry extends Service {
    * latest state; a Session that has no cell of it gets no row. {@link restore}
    * folds only live units, so its refreshed rows omit released units.
    * @param session - the session whose unit states are checkpointed.
-   * @returns one row per registered key, plus one per released key with a cell for this Session.
+   * @returns one row per cacheable registered key, plus one per released key with a cell for this Session.
    */
   checkpoint(session: Session): ProjectionCheckpoint {
     const rows: ProjectionCheckpoint = {}
     for (const registration of this.registrations.values()) {
+      if (registration.def.replayOnHydrate) continue
       const cell = registration.refs === 0
         ? registration.cells.get(session)
         : this.cellFor(registration, session)
@@ -638,6 +653,7 @@ export class SessionProjectionRegistry extends Service {
     let floor: number | undefined
     for (const registration of this.registrations.values()) {
       if (registration.refs === 0) continue
+      if (registration.def.replayOnHydrate) continue
       const row = checkpoint[registration.def.key]
       const need = row !== undefined && row.ver === registration.def.stateVersion
         ? Math.max(row.seq + 1, 0)
@@ -723,6 +739,7 @@ export class SessionProjectionRegistry extends Service {
     for (const registration of this.registrations.values()) {
       if (registration.refs === 0) continue
       const def = registration.def
+      if (def.replayOnHydrate) continue
       const row = checkpoint[def.key]
       const usable = row !== undefined
         && row.ver === def.stateVersion
@@ -776,6 +793,7 @@ export class SessionProjectionRegistry extends Service {
     let complete = true
     for (const registration of this.registrations.values()) {
       if (registration.refs === 0) continue
+      if (registration.def.replayOnHydrate) continue
       const current = registration.cells.get(session)
       if (current?.observedSeq !== endSeq) {
         complete = false
@@ -801,6 +819,7 @@ export class SessionProjectionRegistry extends Service {
     )
     for (const registration of this.registrations.values()) {
       if (registration.refs === 0) continue
+      if (registration.def.replayOnHydrate) continue
       const row = restored.checkpoint[registration.def.key]
       /* v8 ignore next -- restore() writes a row for every registration in the same synchronous pass. */
       if (row === undefined) continue

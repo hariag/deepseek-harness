@@ -11,8 +11,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
+import { createHash } from 'node:crypto'
 import { errorChain } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+import type { SessionLiveEventReceipt } from '@deepseek-ai/dsh-session-persistence'
 import {
   assertContiguous,
   SessionAlreadyExistsError,
@@ -35,6 +37,22 @@ import type { SessionWriteLease } from './lease.ts'
 
 /** Maximum intentional wait before a routed live session batch starts writing. */
 export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
+
+const LIVE_RECEIPT_MAX_OBSERVERS = 128
+const LIVE_RECEIPT_MAX_EVENTS = 128
+/** Materialize first so lossy JSON and re-read getters cannot produce a false match. */
+const receiptSnapshot = (event: SessionEvent): SessionEvent => {
+  const snapshot = materializeAppendBatch([event])[0]
+  if (snapshot === undefined) throw new Error('missing live event snapshot')
+  return snapshot
+}
+const eventDigest = (event: SessionEvent): string => createHash('sha256').update(JSON.stringify(event)).digest('hex')
+
+interface LiveReceiptObservation {
+  readonly type: string
+  readonly events: Map<number, string>
+  disposed: boolean
+}
 
 /** The file-storage primitives the handle drives on its owning service. */
 export interface JsonlHandleStorage {
@@ -93,6 +111,8 @@ export class JsonlSessionHandle implements SessionHandle {
   /** Set when a drain failed; the automatic timer stays quiet until the next drain. */
   private drainPaused = false
   private draining: Promise<void> | undefined
+  /** Active, bounded observations of routed live events. */
+  private readonly liveReceipts = new Set<LiveReceiptObservation>()
 
   constructor(
     private readonly storage: JsonlHandleStorage,
@@ -102,6 +122,7 @@ export class JsonlSessionHandle implements SessionHandle {
     private readonly state: StorageHandleState,
     /** The cross-process write lock; a create handle acquires it lazily at first materialization. */
     private lease?: SessionWriteLease,
+    private readonly appendValidator?: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>,
   ) {}
 
   /** Exact fork-inherited prefix length stored with this session's log. */
@@ -223,6 +244,11 @@ export class JsonlSessionHandle implements SessionHandle {
    */
   close(): Promise<void> {
     return this.closing ??= (async () => {
+      for (const observation of this.liveReceipts) {
+        observation.disposed = true
+        observation.events.clear()
+      }
+      this.liveReceipts.clear()
       let drainFailure: unknown
       // Producers on other fibers may still publish while close waits for
       // in-flight mutations (root disposal is concurrent), so drain again
@@ -273,12 +299,65 @@ export class JsonlSessionHandle implements SessionHandle {
    *   (the events stay buffered; the next {@link drainLive} retries loudly).
    */
   enqueueLive(event: SessionEvent, reportBackgroundFailure: (error: unknown) => void): void {
-    this.buffered.push(structuredClone(event))
+    const snapshot = structuredClone(event)
+    this.buffered.push(snapshot)
+    const observations = [...this.liveReceipts].filter(item => item.type === snapshot.type)
+    if (observations.length > 0) {
+      try {
+        const digest = eventDigest(receiptSnapshot(snapshot))
+        for (const item of observations) {
+          item.events.set(snapshot.seq, digest)
+          if (item.events.size > LIVE_RECEIPT_MAX_EVENTS) {
+            const oldest = item.events.keys().next().value
+            if (oldest !== undefined) item.events.delete(oldest)
+          }
+        }
+      } catch {
+        for (const item of observations) item.events.delete(snapshot.seq)
+      }
+    }
     if (this.batchTimer !== undefined || this.drainPaused) return
     this.batchTimer = setTimeout(() => {
       this.batchTimer = undefined
       this.drainLive().catch(reportBackgroundFailure)
     }, LIVE_WRITE_BATCH_MAX_DELAY_MS)
+  }
+
+  /**
+   * Start one bounded observation tied to this writer's lifetime.
+   * @param type - the event type to observe.
+   * @returns a scoped confirmation handle.
+   */
+  beginLiveEventReceipt(type: string): SessionLiveEventReceipt {
+    this.assertOpen('live event receipt')
+    if (this.access !== 'write' || typeof type !== 'string' || type.trim() === '') throw new Error('invalid live event receipt request')
+    if (this.liveReceipts.size >= LIVE_RECEIPT_MAX_OBSERVERS) throw new Error('too many active live event receipts')
+    const observation: LiveReceiptObservation = { type, events: new Map(), disposed: false }
+    this.liveReceipts.add(observation)
+    return {
+      confirm: async (event: SessionEvent): Promise<void> => {
+        if (observation.disposed) throw new Error('invalid or closed live event receipt')
+        const snapshot = receiptSnapshot(event)
+        // Event getters can synchronously dispose the observer while taking the snapshot.
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- reentrant observer disposal is not tracked by TypeScript.
+        if (observation.disposed || snapshot.type !== type || !Number.isSafeInteger(snapshot.seq) || snapshot.seq < 0) {
+          throw new Error('invalid or closed live event receipt')
+        }
+        const digest = eventDigest(snapshot)
+        if (observation.events.get(snapshot.seq) !== digest) throw new Error('live event not observed by this receipt')
+        await this.drainLive()
+        await this.flush()
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- disposal can happen during the flush await.
+        if (observation.disposed || this.state.cursor <= snapshot.seq || observation.events.get(snapshot.seq) !== digest) {
+          throw new Error('live event durability is uncertain')
+        }
+      },
+      dispose: (): void => {
+        observation.disposed = true
+        observation.events.clear()
+        this.liveReceipts.delete(observation)
+      },
+    }
   }
 
   /**
@@ -320,6 +399,7 @@ export class JsonlSessionHandle implements SessionHandle {
   private async persistContiguous(batch: readonly SessionEvent[]): Promise<void> {
     if (this.access !== 'write') throw new SessionReadOnlyError(this.id, 'append')
     if (batch.length === 0) return
+    if (this.appendValidator !== undefined) await this.appendValidator(this.id, this.header, batch)
     await this.ensureLease()
     assertContiguous(this.id, batch, this.state.cursor)
     // Commit any pending torn-tail repair first, clearing each step's state
@@ -521,6 +601,25 @@ export class JsonlBackendTracker {
       }
     }
     if (errors.length > 0) throw new AggregateError(errors, `${this.name} flush failed`)
+  }
+
+  /**
+   * Begin one observation bound to the current writer.
+   * @param id - the live session's id.
+   * @param type - the event type to observe.
+   * @returns a scoped confirmation handle.
+   */
+  beginLiveEventReceipt(id: SessionId, type: string): SessionLiveEventReceipt {
+    const writer = this.writers.get(id)
+    if (writer === undefined || writer === null) throw new Error(`no live writer for session "${id}"`)
+    const receipt = writer.beginLiveEventReceipt(type)
+    return {
+      confirm: async (event) => {
+        await receipt.confirm(event)
+        if (this.writers.get(id) !== writer) throw new Error(`session "${id}" writer changed during confirmation`)
+      },
+      dispose: () => { receipt.dispose() },
+    }
   }
 
   /**

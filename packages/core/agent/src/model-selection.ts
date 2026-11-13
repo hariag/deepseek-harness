@@ -66,11 +66,14 @@ const selectionSchema = z.object({
   reasoningEffort: z.string().min(1).transform(brandString<ReasoningEffortId>).exactOptional(),
 }).nullable()
 
+type ModelSelectionDefinition = ProjectionDefinition<'modelSelection', ModelSelectionProjectionState>
+  & Required<Pick<ProjectionDefinition<'modelSelection', ModelSelectionProjectionState>, 'wire'>>
+
 /**
  * Session selection fold: recorded selections become
  * the pending choice, and each request header retires a matching one.
  */
-export const modelSelectionProjectionDefinition: Required<ProjectionDefinition<'modelSelection', ModelSelectionProjectionState>> = {
+export const modelSelectionProjectionDefinition: ModelSelectionDefinition = {
   key: 'modelSelection',
   stateVersion: 3,
   stateSchema: z.object({ lastUsed: selectionSchema, pending: selectionSchema }),

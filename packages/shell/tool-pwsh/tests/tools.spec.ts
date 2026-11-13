@@ -12,7 +12,7 @@
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
-import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { createInboxStub, provideWorkingDirectoryFixture, unsupportedModel } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -25,7 +25,7 @@ import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import * as ToolJobs from '@deepseek-ai/dsh-tool-jobs'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { SESSION_FORMAT_VERSION, type SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
+import { SESSION_FORMAT_VERSION, Session, type SessionId } from '@deepseek-ai/dsh-session'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { ShellExecutor } from '@deepseek-ai/dsh-shell'
@@ -41,6 +41,15 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 
 /** Empty offset readers for fakes that never produce output. */
 const silentReader = { readFrom: (fromByte: number) => ({ text: '', nextOffset: fromByte, lossy: false }) }
+
+/** Structural Agent fixture with a real guarded Session and explicit unsupported surfaces. */
+function testAgent(session: Session, ctx: Context, inject: Agent['inject'] = () => {}): Agent {
+  return {
+    id: session.id, session, ctx, inject, options: {}, model: unsupportedModel(), inbox: createInboxStub(),
+    status: 'idle', send() {}, followup() {}, steer() {}, cancel() {}, whenIdle: async () => {},
+    runMaintenance: task => task(new AbortController().signal),
+  }
+}
 
 /** Use the newest id returned by the real registry, including settled jobs. */
 function currentId(ctx: Context, owner?: Agent): string {
@@ -261,45 +270,19 @@ function sandboxAgent(
   ctx?: Context,
   onAppend?: (type: string) => void,
 ): Agent {
-  const events: Array<{
-    type: string
-    seq: ReturnType<typeof SessionSeq>
-    time: number
-    data: Record<string, unknown>
-  }> = [
-    { type: 'turn/start', seq: SessionSeq(0), time: 0, data: { turn: 1 } },
-  ]
-  if (mode !== undefined) {
-    events.push({ type: 'sandbox/mode', seq: SessionSeq(1), time: 1, data: { mode } })
-  }
   const id = brandString<SessionId>('sandbox-session')
-  return {
-    id,
-    ...ctx === undefined ? {} : { ctx: ctx.plugin(() => {}).ctx },
-    session: {
-      id,
-      header: { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false },
-      inheritedEventCount: SessionLogOffset(0),
-      firstLiveSeq: SessionLogOffset(0),
-      get seq() { return SessionLogOffset(events.length) },
-      eventAt: (seq: ReturnType<typeof SessionSeq>) => events[seq],
-      snapshotEvents: (
-        fromSeq = SessionLogOffset(0),
-        toSeqExclusive = SessionLogOffset(events.length),
-      ) => events.slice(fromSeq, toSeqExclusive),
-      append: (type: string, data: Record<string, unknown>) => {
-        const event = {
-          type,
-          seq: SessionSeq(events.length),
-          time: events.length,
-          data,
-        }
-        events.push(event)
-        onAppend?.(type)
-        return event
-      },
-    },
-  } as unknown as Agent
+  const session = Session.create(id)
+  session.append('turn/start', { turn: 1 })
+  if (mode !== undefined) session.append('sandbox/mode', { mode })
+  if (onAppend !== undefined) {
+    const append = session.append.bind(session)
+    Reflect.set(session, 'append', (...args: unknown[]) => {
+      const result: unknown = Reflect.apply(append, session, args)
+      if (typeof args[0] === 'string') onAppend(args[0])
+      return result
+    })
+  }
+  return testAgent(session, ctx?.plugin(() => {}).ctx ?? new Context())
 }
 
 /**
@@ -308,22 +291,13 @@ function sandboxAgent(
  * The fake session carries an empty event log (the sandbox-policy resolver
  * folds the log for mode overrides, mirroring a real session).
  */
-async function registerFakeAgent(ctx: Context, sessionId: string): Promise<Agent> {
+async function registerFakeAgent(ctx: Context, sessionId: string, cwd?: string): Promise<Agent> {
   const scopeFiber = ctx.plugin(() => {})
   const id = brandString<SessionId>(sessionId)
-  const agent = {
-    id,
-    ctx: scopeFiber.ctx,
-    session: {
-      id,
-      header: { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false },
-      inheritedEventCount: SessionLogOffset(0),
-      firstLiveSeq: SessionLogOffset(0),
-      seq: SessionLogOffset(0),
-      eventAt: () => undefined,
-      snapshotEvents: () => [],
-    },
-  } as unknown as Agent
+  const session = Session.create(id, undefined, {
+    version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false, ...cwd === undefined ? {} : { cwd },
+  })
+  const agent = testAgent(session, scopeFiber.ctx)
   await ctx.agents.register(agent)
   return agent
 }
@@ -451,8 +425,7 @@ describe('execution through the bash seam', () => {
     tempDirs.push(dshHome)
     const { ctx, bash } = await setup({}, dshHome)
     bash.handler = () => runResult('hi\n')
-    const agent = await registerFakeAgent(ctx, 'session-1')
-    Object.assign(agent.session.header, { cwd: '/sessions/s1' })
+    const agent = await registerFakeAgent(ctx, 'session-1', '/sessions/s1')
     const result = await call(ctx, 'pwsh', {
       command: 'Write-Output hi',
       description: 'say hi',
@@ -475,8 +448,7 @@ describe('execution through the bash seam', () => {
   it('resolves a relative workdir against the session cwd, absolute ones verbatim', async () => {
     const { ctx, bash } = await setup()
     bash.handler = () => runResult('ok\n')
-    const agent = await registerFakeAgent(ctx, 'session-cwd')
-    Object.assign(agent.session.header, { cwd: '/sessions/s1' })
+    const agent = await registerFakeAgent(ctx, 'session-cwd', '/sessions/s1')
     await call(ctx, 'pwsh', { command: 'pwd', description: 'cwd', workdir: 'sub/dir' }, agent)
     expect(bash.requests[0]?.workdir).toBe(resolvePath('/sessions/s1', 'sub/dir'))
     await call(ctx, 'pwsh', { command: 'pwd', description: 'cwd', workdir: resolvePath('/abs/path') }, agent)
@@ -602,8 +574,7 @@ describe('per-call sandbox policy resolution', () => {
     const { ctx, bash } = await setupSandboxed()
     const sessionCwd = mkdtempSync(join(tmpdir(), 'dsh-tool-pwsh-policy-'))
     tempDirs.push(sessionCwd)
-    const agent = await registerFakeAgent(ctx, 'policy-session')
-    Object.assign(agent.session.header, { cwd: sessionCwd })
+    const agent = await registerFakeAgent(ctx, 'policy-session', sessionCwd)
     const result = await call(ctx, 'pwsh', { command: 'Write-Output hi', description: 'say hi' }, agent)
     expect(result.isError).toBe(false)
     // The policy preserves Session cwd spelling; its enforcing provider owns canonicalization.
@@ -710,10 +681,10 @@ describe('sandbox escalation through ctx.approval', () => {
     expect(prompted).not.toHaveBeenCalled()
 
     const malformed = sandboxAgent()
-    ;(malformed.session.append as unknown as (
-      type: string,
-      data: Record<string, unknown>,
-    ) => unknown)('sandbox/mode', { mode: 'unknown-mode' })
+    const events = malformed.session.snapshotEvents()
+    Reflect.set(malformed.session, 'snapshotEvents', () => [...events, {
+      type: 'sandbox/mode', data: { mode: 'unknown-mode' }, seq: malformed.session.seq, time: 0,
+    }])
     expect(text(await call(ctx, 'pwsh', escalate, malformed))).toContain('not strictly wider')
   })
 

@@ -57,6 +57,8 @@ const definition = {
 
 `await register(definition)` 从 `stateSchema` 推导宿主状态类型，安装单元，并返回提供同步 `stateOf(session)` 读取和 `dispose(): Promise<void>` 的 handle。等待 `dispose()` 完成即可释放注册；重复调用是安全的。具有相同 key 和 `stateVersion` 的注册方共享 cell；版本不兼容或非法时注册会拒绝。注册归调用方 fiber 所有。最后一个注册方注销后，单元退出全局事件驱动、快照、恢复读取和变更通知；`checkpoint(session)` 仍保留每个 Session 中该单元的最后一个 cell，直到同一 key 再次注册、由新单元重新折叠日志。注册表不再推进这个 cell，但已保留的 handle 读取时仍会把它向前推进，检查点输出推进后的 cell。已有 handle 仍可读取：它保留原有单元，按需折叠新增的 Session 事件，即使同一 key 后来注册了其他版本也不受影响。读取 handle 不会初始化无关单元，也不会重新注册。载体用 `snapshot(session)` 读取一致的客户端视图切面，用 `onChanged(listener)` 按每个变化的单元接收一次调用，用 `onEventChanged(listener)` 按每个已提交事件接收一次调用，列出该事件改变了视图的全部客户端可见单元。
 
+用于授权工作的仅宿主单元可设置 `replayOnHydrate: true`。该 key 同时只能有一个存活所有者，不提供 wire 视图，检查点和冷恢复路径会省略它。首次实时读取时从 Session 的权威事件折叠，后续读取推进实时 cell。这样不依赖可丢弃的缓存作准入决定，也不在每次检查点复制该状态。同进程插件仍是可信代码；此机制不构成隔离插件的沙箱。
+
 ```text
 const todoProjectionHandle = await ctx.sessionProjections.register(definition)
 const state = todoProjectionHandle.stateOf(session)

@@ -7,7 +7,7 @@ import { Context, LoggerLevel } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import { Session, type SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import AgentPresets from '@deepseek-ai/dsh-agent-preset-registry'
@@ -19,6 +19,17 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 const contexts: Context[] = []
 const roots: string[] = []
 const SIGNAL = new AbortController().signal
+
+function testAgent(id: SessionId, ctx: Context): Agent {
+  const unused = (): never => { throw new Error('unexpected Agent fixture operation') }
+  return {
+    id, ctx, session: Session.create(id), options: {}, status: 'idle',
+    model: { current: () => undefined, select: unused },
+    inbox: { nextStep: [], nextTurn: [], clear: unused, append: unused, prepend: unused, replace: unused, remove: unused, splice: unused },
+    send: unused, followup: unused, steer: unused, inject: unused, cancel: unused,
+    whenIdle: async () => {}, runMaintenance: task => task(new AbortController().signal),
+  }
+}
 
 afterEach(async () => {
   await Promise.all(contexts.splice(0).map(ctx => ctx.fiber.dispose()))
@@ -195,7 +206,7 @@ describe('DeepSeek plugin package inventory', () => {
 
     const id = brandString<SessionId>('bare-agent')
     const agentScope = createScope(ctx, {})
-    await ctx.agents.register({ id, ctx: agentScope.ctx, session: { id } } as unknown as Agent)
+    await ctx.agents.register(testAgent(id, agentScope.ctx))
     const bare = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL, sessionId: id })
     expect(bare.fields.dsh_plugin_packages?.packages).toEqual([{ name: 'host-only', version: '3.0.0' }])
   })
@@ -308,7 +319,7 @@ describe('DeepSeek plugin package inventory', () => {
     const agentScope = createScope(ctx, {})
     await ctx.agentPresets.mount(agentScope.ctx)
     const id = brandString<SessionId>('preset-agent')
-    const agent = { id, ctx: agentScope.ctx, session: { id } } as unknown as Agent
+    const agent = testAgent(id, agentScope.ctx)
     await ctx.agents.register(agent)
     const modules = ctx.agentPresets.inspectCompositions(agentScope.ctx)
       .flatMap(row => row.modules).filter(row => row.moduleName === 'preset-only/plugin.mjs')

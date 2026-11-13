@@ -33,6 +33,8 @@ The seam ships the [JSONL](../session-persistence-jsonl/README.md) backend: one 
 
 ### What the service provides
 
+`beginLiveEventReceipt(sessionId, type)` opens an optional, bounded observation on that session's current writer. Call `confirm` with the exact observed event and always dispose the receipt; a successful confirmation proves durability of that event only, not that an input ran or completed. Unsupported backends and missing writers reject before observation; if confirmation rejects after an event was emitted, its outcome remains unknown. This API does not stop an Agent from claiming an input while confirmation is pending.
+
 With a backend mounted, five service methods address stored sessions:
 
 ```text

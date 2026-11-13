@@ -1,7 +1,7 @@
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { createInboxStub, provideWorkingDirectoryFixture, unsupportedModel } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it, vi } from 'vitest'
@@ -13,7 +13,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH } from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import { Session, type SessionId } from '@deepseek-ai/dsh-session'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import * as ToolJobs from '@deepseek-ai/dsh-tool-jobs'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
@@ -28,6 +28,15 @@ import * as BashEnvPlugin from '@deepseek-ai/dsh-shell-env'
 import { processOutcome } from '../src/background.ts'
 import { renderJobRead, renderResult } from '../src/render.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
+
+/** Structural Agent fixture with a real guarded Session and explicit unsupported surfaces. */
+function testAgent(session: Session, ctx: Context, inject: Agent['inject'] = () => {}): Agent {
+  return {
+    id: session.id, session, ctx, inject, options: {}, model: unsupportedModel(), inbox: createInboxStub(),
+    status: 'idle', send() {}, followup() {}, steer() {}, cancel() {}, whenIdle: async () => {},
+    runMaintenance: task => task(new AbortController().signal),
+  }
+}
 
 /** Use the newest id returned by the real registry, including settled jobs. */
 function currentId(ctx: Context, owner?: Agent): string {
@@ -90,12 +99,7 @@ async function setupWithJobs() {
 async function registerFakeAgent(ctx: Context, sessionId: string, inject: (...args: unknown[]) => void = () => {}): Promise<Agent> {
   const scopeFiber = ctx.plugin(() => {})
   const id = brandString<SessionId>(sessionId)
-  const agent = {
-    id,
-    ctx: scopeFiber.ctx,
-    inject,
-    session: { id, header: { version: 0, id, createdAt: 0 } },
-  } as unknown as Agent
+  const agent = testAgent(Session.create(id), scopeFiber.ctx, inject)
   await ctx.agents.register(agent)
   return agent
 }
@@ -238,26 +242,19 @@ function sandboxAgent(
   ctx?: Context,
   onAppend?: (type: string) => void,
 ): Agent {
-  const events: Array<{ type: string; data?: Record<string, unknown>; seq: number }> = [{ type: 'turn/start', seq: 0, data: { turn: 1 } }]
-  if (mode !== undefined) events.push({ type: 'sandbox/mode', seq: events.length, data: { mode } })
   const id = brandString<SessionId>('sandbox-session')
-  return {
-    id,
-    ...ctx === undefined ? {} : { ctx: ctx.plugin(() => {}).ctx },
-    session: {
-      id,
-      header: { version: 0, id, createdAt: 0 },
-      get seq() { return events.length },
-      eventAt: (seq: number) => events[seq],
-      snapshotEvents: () => events,
-      append: (type: string, data: Record<string, unknown>) => {
-        const event = { type, data, seq: events.length }
-        events.push(event)
-        onAppend?.(type)
-        return event
-      },
-    },
-  } as unknown as Agent
+  const session = Session.create(id)
+  session.append('turn/start', { turn: 1 })
+  if (mode !== undefined) session.append('sandbox/mode', { mode })
+  if (onAppend !== undefined) {
+    const append = session.append.bind(session)
+    Reflect.set(session, 'append', (...args: unknown[]) => {
+      const result: unknown = Reflect.apply(append, session, args)
+      if (typeof args[0] === 'string') onAppend(args[0])
+      return result
+    })
+  }
+  return testAgent(session, ctx?.plugin(() => {}).ctx ?? new Context())
 }
 
 describe('bash tool', () => {
@@ -826,11 +823,10 @@ describe('sandbox escalation through the generic task producer', () => {
     expect(prompted).not.toHaveBeenCalled()
 
     const malformed = sandboxAgent()
-    ;(malformed.session.snapshotEvents() as unknown as Array<{ type: string; data: { mode: string }; seq: number }>).push({
-      type: 'sandbox/mode',
-      data: { mode: 'unknown-mode' },
-      seq: malformed.session.seq,
-    })
+    const events = malformed.session.snapshotEvents()
+    Reflect.set(malformed.session, 'snapshotEvents', () => [...events, {
+      type: 'sandbox/mode', data: { mode: 'unknown-mode' }, seq: malformed.session.seq, time: 0,
+    }])
     expect(text(await call(ctx, 'bash', escalate, malformed))).toContain('not strictly wider')
   })
 

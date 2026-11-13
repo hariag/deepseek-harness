@@ -853,7 +853,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("all", "sdk-default", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-mcp", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-profile-plugin", "sdk-plugin-manager", "sdk-office", "sdk-authoring", "sdk-live", "runner", "direct"),
+        choices=("all", "sdk-default", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-mcp", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-guarded-recovery", "sdk-profile-plugin", "sdk-plugin-manager", "sdk-office", "sdk-authoring", "sdk-live", "runner", "direct"),
         default="all",
     )
     parser.add_argument("--exe", type=Path)
@@ -872,9 +872,9 @@ def main() -> None:
         parser.error("--scenario sdk-profile-plugin requires --installed-wheel")
     if args.installed_wheel:
         args.exe = assert_installed_wheel_environment()
-    if args.scenario in {"all", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-office", "sdk-authoring", "sdk-plugin-manager", "runner", "direct"} and args.exe is None:
+    if args.scenario in {"all", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-guarded-recovery", "sdk-office", "sdk-authoring", "sdk-plugin-manager", "runner", "direct"} and args.exe is None:
         parser.error("--exe is required for custom, minimal, dynamic-tools, fs-search, spawn-node, snapshot, recovery, restart, office, runner, and direct scenarios")
-    if args.update_snapshots and args.scenario not in {"all", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-authoring"}:
+    if args.update_snapshots and args.scenario not in {"all", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-guarded-recovery", "sdk-authoring"}:
         parser.error("--update-snapshots requires --scenario sdk-minimal, sdk-minimal-in-history, sdk-dynamic-tools, sdk-snapshot, sdk-recovery, sdk-restart, sdk-authoring, or all")
     if args.exe is not None and not args.exe.is_file():
         parser.error(f"runtime executable does not exist: {args.exe}")
@@ -940,6 +940,9 @@ def main() -> None:
             assert args.exe is not None
             smoke_sdk_v3_resume(model.url, args.exe.resolve())
             smoke_sdk_restart_snapshot(model.url, args.exe.resolve(), args.update_snapshots)
+        if args.scenario in {"all", "sdk-guarded-recovery"}:
+            assert args.exe is not None
+            smoke_sdk_guarded_recovery(model.url, args.exe.resolve(), args.update_snapshots)
         if args.installed_wheel and args.scenario in {"all", "sdk-profile-plugin"}:
             smoke_sdk_profile_plugin(model.url)
         if args.scenario in {"all", "direct"}:
@@ -1752,6 +1755,88 @@ def smoke_sdk_snapshot(base_url: str, executable: Path, update_snapshots: bool) 
     """Exercise native and PTC calls in independent packaged-runtime compositions."""
     for mode in ("native", "ptc"):
         smoke_sdk_snapshot_mode(base_url, executable, update_snapshots, mode)
+
+
+def smoke_sdk_guarded_recovery(base_url: str, executable: Path, update_snapshots: bool) -> None:
+    """Exercise a trusted test host's parked admission across two real SDK runtimes."""
+    from deepseek_harness import DeepSeekHarness
+
+    with tempfile.TemporaryDirectory(prefix="dsh-sdk-guarded-recovery-") as temporary:
+        root = Path(temporary).resolve()
+        dsh_home = root / "home"
+        sessions = dsh_home / "sessions"
+        journal = dsh_home / "guarded-sdk-test-journal.json"
+        patch = write_advanced_profile_patch(root, "guarded.patch.yml", sessions)
+        fixture = Path(__file__).resolve().parent.parent / "snapshots/sdk/guarded-recovery/runtime.mjs"
+        host_patch = write_profile_patch(root, "host.patch.yml", sessions, [{"insert": [
+            {"id": "guarded-sdk-test-host", "name": fixture.as_uri()},
+        ]}])
+
+        def connect() -> DeepSeekHarness:
+            return DeepSeekHarness(
+                provider="deepseek-official", model="smoke-model", cwd=str(root), dsh_bin=str(executable),
+                dsh_home=str(dsh_home), patches=(str(patch), str(host_patch)),
+                env={"DSH_PERMISSION_MODE": "danger-full-access", "DSH_TELEMETRY_DISABLED": "1",
+                     "DSH_GUARDED_SNAPSHOT_JOURNAL": str(journal)},
+                api_key="sk-keyless-smoke", base_url=base_url, request_timeout_seconds=60,
+            )
+
+        before_requests = len(MockModelHandler.requests)
+        with connect() as harness:
+            session = harness.start_session(SNAPSHOT_SESSION_ID)
+            session.get_working_directory()
+        before = read_session_logs(sessions)[SNAPSHOT_SESSION_ID]
+        if len(MockModelHandler.requests) != before_requests:
+            raise AssertionError("parked guarded input reached the model before provider restoration")
+        if sum(row.get("type") == "agent/admission/hold" for row in before) != 1:
+            raise AssertionError("guarded admission was not durably parked")
+        def guarded_insertions(rows: list[dict]) -> int:
+            return sum(
+                row.get("type") == "agent/inbox/spliced"
+                and row.get("data", {}).get("target") == "next-turn"
+                and any(message.get("id") == "guarded-sdk-message" for message in row["data"].get("inserted", []))
+                for row in rows
+            )
+        if guarded_insertions(before) != 1 or any(
+            row.get("type") == "user/message" and row.get("data", {}).get("id") == "guarded-sdk-message"
+            for row in before
+        ):
+            raise AssertionError("parked guarded input was not inserted exactly once before restart")
+
+        with connect() as harness:
+            harness.start()
+            with harness.client.subscribe_session_notifications(SNAPSHOT_SESSION_ID) as subscription:
+                session = harness.resume_session(SNAPSHOT_SESSION_ID)
+                result = session.run("Reply with the smoke text")
+                notifications = []
+                while True:
+                    try:
+                        notifications.append(subscription.next(timeout_seconds=0))
+                    except TimeoutError:
+                        break
+        logs = read_session_logs(sessions)
+        rows = logs[SNAPSHOT_SESSION_ID]
+        if rows[:len(before)] != before:
+            raise AssertionError("guarded recovery replaced durable history")
+        if guarded_insertions(rows) != 1:
+            raise AssertionError("guarded recovery inserted the message more than once")
+        if len(MockModelHandler.requests) != before_requests + 2 or result.final_response != EXPECTED_TEXT:
+            raise AssertionError("guarded and ordinary inputs did not complete as two model turns")
+        for event_type in ("agent/admission/hold", "agent/admission/release", "agent/admission/reconciled"):
+            if sum(row.get("type") == event_type for row in rows) != 1:
+                raise AssertionError(f"unexpected guarded event count: {event_type}")
+        guarded = [index for index, row in enumerate(rows) if row.get("type") == "user/message"
+                   and isinstance(row.get("data"), dict) and row["data"].get("id") == "guarded-sdk-message"]
+        ordinary = [index for index, row in enumerate(rows) if row.get("type") == "user/message"
+                    and isinstance(row.get("data"), dict) and row["data"].get("source", {}).get("kind") == "user"]
+        if len(guarded) != 1 or len(ordinary) != 1 or guarded[0] >= ordinary[0]:
+            raise AssertionError("guarded and ordinary message order was not preserved")
+        if not any(item.method == "session.event" and item.payload.get("event", {}).get("type") == "agent/admission/reconciled"
+                   for item in notifications):
+            raise AssertionError("SDK did not receive the guarded reconciliation event")
+        files = build_snapshot_files(result, logs, [], root)
+        directory = ADVANCED_SNAPSHOT_ROOT / "guarded-recovery"
+        compare_snapshot_files(files, update_snapshots, directory, ("result.json", "session.v4.jsonl"), native_writer_output=True)
 
 
 def smoke_sdk_snapshot_mode(
