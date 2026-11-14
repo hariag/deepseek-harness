@@ -126,6 +126,7 @@ export class ReactLoopAgent implements Agent {
   readonly inbox: ReactLoopInbox
   private readonly admissions: AdmissionState
   private guardedClaimCoordinator: GuardedClaimCoordinator | undefined
+  private guardedStartCallbacks: { before: NonNullable<GuardedClaimCoordinator['beforeTurnStart']>, cancel: NonNullable<GuardedClaimCoordinator['cancelTurnStart']> } | undefined
   private guardedCoordinatorReady: Promise<void> | undefined
   private guardedCoordinatorToken: object | undefined
   private guardedClaimFault = false
@@ -135,6 +136,7 @@ export class ReactLoopAgent implements Agent {
   private readonly removeAdmissionGuard: () => void
   private allowedAdmissionEvent: { type: string; messageId: string; admissionId: string } | undefined
   private allowedGuardedInput: UserMessage | undefined
+  #guardedStartCallbackActive = false
   private preserveGuardedDuringDisposal = false
   private readonly stoppingInputs = new AsyncLocalStorage<StoppingInputs>()
   private phase: Phase
@@ -180,6 +182,9 @@ export class ReactLoopAgent implements Agent {
       id => this.admissions.hasSeen(id))
     this.removeAdmissionGuard = session.registerAppendGuard((events) => { this.validateAdmissionBatch(events) })
     this.phase = { kind: 'idle', lastTurn }
+    this.ctx.on('session/event', (subject, event) => {
+      if (subject === this.session && event.type === 'agent/inbox/spliced') this.admissions.notifyChange()
+    })
     this.runtimeContext = new RuntimeContextProjection(this.ctx, session)
     this.systemPrompt = new SystemPromptProjection(session)
   }
@@ -227,6 +232,7 @@ export class ReactLoopAgent implements Agent {
   disposeAdmissionGuard(): void { this.removeAdmissionGuard() }
 
   private validateAdmissionBatch(events: readonly SessionEvent[]): void {
+    if (this.#guardedStartCallbackActive) throw new Error('Session writes are not allowed in guarded start callbacks')
     const pending = {
       'next-step': [...this.inbox.nextStep],
       'next-turn': [...this.inbox.nextTurn],
@@ -280,7 +286,12 @@ export class ReactLoopAgent implements Agent {
     if (typeof coordinator !== 'function' || this.guardedClaimCoordinator !== undefined || this.guardedClaimFault) {
       throw new Error('guarded claim coordinator is unavailable or already installed')
     }
+    const before = coordinator.beforeTurnStart, cancel = coordinator.cancelTurnStart
+    if ((before === undefined) !== (cancel === undefined) || (before !== undefined && typeof before !== 'function') || (cancel !== undefined && typeof cancel !== 'function')) {
+      throw new Error('guarded start callbacks must be installed together')
+    }
     this.guardedClaimCoordinator = coordinator
+    this.guardedStartCallbacks = before !== undefined && cancel !== undefined ? { before, cancel } : undefined
     this.guardedCoordinatorReady = ready
     const token = {}
     this.guardedCoordinatorToken = token
@@ -289,6 +300,7 @@ export class ReactLoopAgent implements Agent {
     } catch (error: unknown) {
       if (this.guardedCoordinatorToken === token) {
         this.guardedClaimCoordinator = undefined
+        this.guardedStartCallbacks = undefined
         this.guardedCoordinatorReady = undefined
         this.guardedCoordinatorToken = undefined
         this.admissions.notifyChange()
@@ -301,6 +313,7 @@ export class ReactLoopAgent implements Agent {
       installed = false
       if (this.guardedCoordinatorToken === token) {
         this.guardedClaimCoordinator = undefined
+        this.guardedStartCallbacks = undefined
         this.guardedCoordinatorReady = undefined
         this.guardedCoordinatorToken = undefined
         this.admissions.notifyChange()
@@ -467,6 +480,7 @@ export class ReactLoopAgent implements Agent {
       } finally { receipt.dispose() }
     } catch (error: unknown) {
       if (appended) this.failGuardedClaim()
+      else this.admissions.requireRevalidation(expected.id)
       throw error
     } finally { this.reconciling.delete(expected.id) }
   }
@@ -496,9 +510,9 @@ export class ReactLoopAgent implements Agent {
         if (removed !== undefined) ambiguous = true
         else removed = event
       })
-      this.admissions.cancel(expected.id, admissionId)
       const tombstone = this.appendAdmission('agent/admission/cancel', expected.id, admissionId)
       appended = true
+      this.admissions.cancel(expected.id, admissionId)
       await cancelReceipt.confirm(tombstone)
       if (!pending().some(item => isDeepStrictEqual(item, expected))) throw new Error('guarded cancellation outcome is unknown')
       this.allowedGuardedDiscard = expected.id
@@ -511,6 +525,7 @@ export class ReactLoopAgent implements Agent {
       this.admissions.notifyChange()
     } catch (error: unknown) {
       if (appended) this.failGuardedClaim()
+      else this.admissions.requireRevalidation(expected.id)
       throw error
     } finally {
       this.reconciling.delete(expected.id)
@@ -537,8 +552,14 @@ export class ReactLoopAgent implements Agent {
           for (const message of [...this.inbox.nextStep, ...this.inbox.nextTurn]) {
             const admissionId = this.admissions.admissionId(message.id)
             if (admissionId === undefined || this.admissions.isCanceled(message.id)) continue
-            this.admissions.cancel(message.id, admissionId)
-            this.appendAdmission('agent/admission/cancel', message.id, admissionId)
+            try { this.appendAdmission('agent/admission/cancel', message.id, admissionId) } catch (error: unknown) {
+              this.admissions.requireRevalidation(message.id)
+              throw error
+            }
+            try { this.admissions.cancel(message.id, admissionId) } catch (error: unknown) {
+              this.failGuardedClaim()
+              throw error
+            }
           }
         }
         this.preserveGuardedDuringDisposal = cause.kind === 'disposed'
@@ -643,9 +664,10 @@ export class ReactLoopAgent implements Agent {
     } finally {
       /* v8 ignore next -- kick owns a running phase until this driver boundary */
       if (this.phase.kind === 'running') {
-        const { turn, wakeRequested } = this.phase
+        const { turn, wakeRequested, abort } = this.phase
+        const cause = abortedCancelCause(abort.signal)
         this.setPhase({ kind: 'idle', lastTurn: turn })
-        if (wakeRequested && this.inbox.hasPending) this.wakeDriver()
+        if (cause?.kind !== 'disposed' && wakeRequested && this.inbox.hasPending) this.wakeDriver()
       }
     }
   }
@@ -665,6 +687,8 @@ export class ReactLoopAgent implements Agent {
 
   private async preStep(
     target: InboxTarget, position: { turn: number; step: number; turnStartSeq: number }, turnKind: TurnKind, continuationIds: Set<string>,
+    initialGuarded?: readonly ProposedInput[],
+    initialCoordinatorToken?: object,
   ): Promise<PreparedStep> {
     /* v8 ignore next -- private callers establish the running phase before proposing a step */
     if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": pre-step outside running phase`)
@@ -672,6 +696,12 @@ export class ReactLoopAgent implements Agent {
     let proposed: ReturnType<ReactLoopAgent['proposedClaim']>
     while (true) {
       proposed = this.proposedClaim(target, turnKind, continuationIds)
+      if (turnKind === 'initial' && ((initialGuarded !== undefined && (!isDeepStrictEqual(proposed, initialGuarded) || initialCoordinatorToken !== this.guardedCoordinatorToken))
+        || (initialGuarded === undefined && proposed.some(item => this.admissions.hasSeen(item.message.id))))) {
+        for (const item of [...(initialGuarded ?? []), ...proposed]) this.admissions.requireRevalidation(item.message.id)
+        this.phase.wakeRequested = true
+        throw new Error('guarded turn candidate changed before claim')
+      }
       const candidates = proposed.map(item => item.message.id)
       if (this.admissions.isBlocked(candidates)) {
         if (this.guardedClaimCoordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
@@ -681,7 +711,8 @@ export class ReactLoopAgent implements Agent {
       signal.throwIfAborted()
       if (candidates.some(id => this.admissions.hasSeen(id))) {
         await this.awaitGuardedCoordinator(signal)
-        if (!isDeepStrictEqual(proposed, this.proposedClaim(target, turnKind, continuationIds))) continue
+        if (!isDeepStrictEqual(proposed, this.proposedClaim(target, turnKind, continuationIds))
+          || (turnKind === 'initial' && initialGuarded !== undefined && initialCoordinatorToken !== this.guardedCoordinatorToken)) continue
       }
       break
     }
@@ -705,6 +736,7 @@ export class ReactLoopAgent implements Agent {
       const coordinator = this.guardedClaimCoordinator
       const token = this.guardedCoordinatorToken
       if (coordinator === undefined || token === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+      if (turnKind === 'initial' && initialGuarded !== undefined && token !== initialCoordinatorToken) throw new Error('guarded turn coordinator changed before claim')
       const original = snapshotJsonValue(proposed)
       if (original === undefined) throw new Error('guarded claim batch is not lossless JSON')
       const allowed = new Set(guarded.map(item => item.message.id))
@@ -786,6 +818,8 @@ export class ReactLoopAgent implements Agent {
     const { signal } = phase.abort
     signal.throwIfAborted()
     const continuations = new Set<string>()
+    let initialGuarded: readonly ProposedInput[] | undefined
+    let initialCoordinatorToken: object | undefined
     while (true) {
       const proposed = this.proposedClaim('next-turn', 'initial', continuations)
       const candidates = proposed.map(item => item.message.id)
@@ -799,14 +833,63 @@ export class ReactLoopAgent implements Agent {
       if (candidates.some(id => this.admissions.hasSeen(id))) {
         await this.awaitGuardedCoordinator(signal)
         if (!isDeepStrictEqual(proposed, this.proposedClaim('next-turn', 'initial', continuations))) continue
+        const snapshot = snapshotJsonValue(proposed)
+        if (snapshot === undefined || snapshot.length !== 1 || this.admissions.admissionId(snapshot[0]!.message.id) === undefined) {
+          throw new Error('guarded turn requires one stable input')
+        }
+        initialGuarded = deepFreeze(snapshot)
+        initialCoordinatorToken = this.guardedCoordinatorToken
+        if (initialCoordinatorToken === undefined) throw new Error('guarded coordinator is unavailable')
       }
       break
     }
     const turn = phase.turn + 1
     let turnStartSeq: number
+    let registeredStart: { coordinator: GuardedClaimCoordinator, cancel: NonNullable<GuardedClaimCoordinator['cancelTurnStart']>, input: Readonly<GuardedClaimInput>, turn: Readonly<{ turn: number, turnStartSeq: number }> } | undefined
     try {
+      if (initialGuarded !== undefined) {
+        const candidate = initialGuarded[0]!
+        const admissionId = this.admissions.admissionId(candidate.message.id), coordinator = this.guardedClaimCoordinator
+        if (admissionId === undefined || coordinator === undefined) throw new Error('guarded turn identity is unavailable')
+        const callbacks = this.guardedStartCallbacks
+        if (callbacks !== undefined) {
+          const input = Object.freeze({ admissionId, message:candidate.message, target:candidate.target })
+          const boundary = Object.freeze({ turn, turnStartSeq:this.session.seq })
+          registeredStart = { coordinator, cancel:callbacks.cancel, input, turn:boundary }
+          let result: unknown
+          this.#guardedStartCallbackActive = true
+          try { result = callbacks.before.call(coordinator, this.session, input, boundary) }
+          finally { this.#guardedStartCallbackActive = false }
+          if (result !== undefined) {
+            this.failGuardedClaim()
+            if (result instanceof Promise) void result.catch(() => {})
+            throw new Error('guarded start registration must be synchronous')
+          }
+          if (this.guardedClaimCoordinator !== coordinator || this.guardedCoordinatorToken !== initialCoordinatorToken || signal.aborted || this.session.seq !== boundary.turnStartSeq
+            || !isDeepStrictEqual(initialGuarded, this.proposedClaim('next-turn', 'initial', continuations))) throw new Error('guarded start changed before publication')
+        }
+      }
       turnStartSeq = this.session.append('turn/start', { turn }).seq
     } catch (error: unknown) {
+      if (registeredStart !== undefined) {
+        try {
+          let result: unknown
+          this.#guardedStartCallbackActive = true
+          try { result = registeredStart.cancel.call(registeredStart.coordinator, this.session, registeredStart.input, registeredStart.turn) }
+          finally { this.#guardedStartCallbackActive = false }
+          if (result !== undefined) {
+            if (result instanceof Promise) void result.catch(() => {})
+            throw new Error('guarded start cleanup must be synchronous')
+          }
+        } catch (cleanupError: unknown) {
+          this.failGuardedClaim()
+          this.throwError(new AggregateError([error, cleanupError], 'guarded start cleanup failed', { cause:error }))
+        }
+      }
+      if (initialGuarded !== undefined) {
+        this.admissions.requireRevalidation(initialGuarded[0]!.message.id)
+        phase.wakeRequested = true
+      }
       this.throwError(error)
     }
     phase.turn = turn
@@ -818,7 +901,7 @@ export class ReactLoopAgent implements Agent {
       while (true) {
         signal.throwIfAborted()
         const step = phase.step + 1
-        const decision = await this.preStep(target, { turn, step, turnStartSeq }, turnKind, stoppingInputs.ids)
+        const decision = await this.preStep(target, { turn, step, turnStartSeq }, turnKind, stoppingInputs.ids, initialGuarded, initialCoordinatorToken)
         if (decision.kind === 'reject') {
           turnEnds = { kind: 'blocked' }
           return false

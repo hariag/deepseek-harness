@@ -28,6 +28,426 @@ async function setup() {
 
 const coordinator: GuardedClaimCoordinator = (_session, _inputs, claim) => { claim(); return 'committed' }
 const options = { provider: 'guarded-provider', model: 'mock' }
+function trackedCoordinator() {
+  const starts = new WeakMap<Session, { input: Parameters<NonNullable<GuardedClaimCoordinator['beforeTurnStart']>>[1], turn: Readonly<GuardedClaimTurn> }>()
+  const tracked: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: (session: Session, input: Parameters<NonNullable<GuardedClaimCoordinator['beforeTurnStart']>>[1], turn: Readonly<GuardedClaimTurn>) => { starts.set(session, { input, turn }) },
+      cancelTurnStart: (session: Session) => { starts.delete(session) } },
+  )
+  return { starts, tracked }
+}
+
+it('registers one guarded start before its exact Session event', async () => {
+  const { ctx } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-reservation'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded start unavailable')
+  const message = createUserMessage({ content: [{ type:'text', text:'task' }], source: { kind:'user' } })
+  let seen = false, ordinaryStarts = 0
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session || event.type !== 'turn/start') return
+    const start = starts.get(agent.session)
+    if (start?.turn.turnStartSeq !== event.seq) { ordinaryStarts += 1; return }
+    expect(start.input.message.id).toBe(message.id)
+    expect(start.input.admissionId).toBe('reserved-start')
+    seen = true
+  })
+  await agent.guardedSend(message, 'next-turn', 'reserved-start')
+  await agent.whenIdle()
+  expect(seen).toBe(true)
+  const start = agent.session.snapshotEvents().find(event => event.type === 'turn/start')
+  expect(start).toBeDefined()
+  agent.followup(createUserMessage({ content:[{ type:'text', text:'ordinary' }], source:{ kind:'user' } }))
+  await agent.whenIdle()
+  expect(ordinaryStarts).toBe(1)
+  dispose()
+  await handle.dispose()
+})
+
+it('illustrates consumer deduplication of two observations by Session and sequence', async () => {
+  const { ctx } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-republish'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded start unavailable')
+  let republished = false, observations = 0, effects = 0
+  const seen = new WeakMap<Session, Set<number>>()
+  const observe = (session: Session, seq: number): void => {
+    if (session !== agent.session || starts.get(agent.session)?.turn.turnStartSeq !== seq) return
+    observations += 1
+    const seqs = seen.get(session) ?? new Set<number>()
+    if (seqs.has(seq)) return
+    seqs.add(seq); seen.set(session, seqs); effects += 1
+  }
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session || event.type !== 'turn/start' || republished) return
+    republished = true
+    observe(session, event.seq)
+    observe(session, event.seq)
+  })
+  await agent.guardedSend(createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } }), 'next-turn', 'republished-start')
+  await agent.whenIdle()
+  expect(republished).toBe(true)
+  expect(observations).toBe(2)
+  expect(effects).toBe(1)
+  await ctx.sessionPersistence.flushLiveSession(agent.id)
+  const reader = await ctx.sessionPersistence.open(agent.id, 'read')
+  try {
+    const { events } = await reader.read()
+    expect(events.every((event, index) => event.seq === index)).toBe(true)
+    expect(events.filter(event => event.type === 'turn/start')).toHaveLength(1)
+  } finally { await reader.close() }
+  dispose()
+  await handle.dispose()
+})
+
+it('does not register an ordinary start as a guarded start', async () => {
+  const { ctx } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-fabricated'), agentOptions: options })
+  const { agent } = handle
+  let observed: unknown
+  ctx.on('session/event', (session, event) => {
+    if (session === agent.session && event.type === 'turn/start') observed = starts.get(agent.session)
+  })
+  agent.session.append('turn/start', { turn:1 })
+  expect(observed).toBeUndefined()
+  agent.session.append('turn/end', { turn:1, reason:{ kind:'completed' } })
+  dispose()
+  await handle.dispose()
+})
+
+it('cleans up a failed provisional registration without starting or claiming a turn', async () => {
+  const { ctx, adapter } = await setup()
+  const cleaned = Promise.withResolvers<void>()
+  let registered = false
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: () => { registered = true; throw new Error('host registration failed') },
+      cancelTurnStart: () => { registered = false; cleaned.resolve() } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-registration-failure'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded send unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(input, 'next-turn', 'registration-failure')
+  await cleaned.promise
+  expect(registered).toBe(false)
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+  expect(adapter.requests).toHaveLength(0)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  dispose()
+  await handle.dispose()
+})
+
+it('prevents Session append from reentering provisional registration', async () => {
+  const { ctx, adapter } = await setup()
+  const cleaned = Promise.withResolvers<void>()
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: (session: Session, _input: unknown, boundary: Readonly<GuardedClaimTurn>) => { session.append('turn/start', { turn:boundary.turn }) },
+      cancelTurnStart: () => { cleaned.resolve() } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-reentrant'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded send unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(input, 'next-turn', 'reentrant-registration')
+  await cleaned.promise
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+  expect(adapter.requests).toHaveLength(0)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  dispose()
+  await handle.dispose()
+})
+
+it('rejects replacing a coordinator with the same function during provisional registration', async () => {
+  const { ctx, adapter } = await setup()
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-generation'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined || agent.setGuardedClaimCoordinator === undefined) throw new Error('guarded send unavailable')
+  const cleaned = Promise.withResolvers<void>()
+  let release = () => {}
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: () => { release(); release = agent.setGuardedClaimCoordinator!(authority) },
+      cancelTurnStart: () => { cleaned.resolve() } },
+  )
+  release = agent.setGuardedClaimCoordinator(authority)
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }); release() })
+  await agent.guardedSend(input, 'next-turn', 'changed-generation')
+  await cleaned.promise
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+  expect(adapter.requests).toHaveLength(0)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  release()
+  await handle.dispose()
+})
+
+it('parks the input if the same coordinator is reinstalled after start but before claim', async () => {
+  const { ctx, adapter } = await setup()
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-generation-after'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined || agent.setGuardedClaimCoordinator === undefined) throw new Error('guarded send unavailable')
+  const { starts, tracked } = trackedCoordinator()
+  let release = agent.setGuardedClaimCoordinator(tracked)
+  const ended = Promise.withResolvers<void>()
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session) return
+    if (event.type === 'turn/start' && starts.get(agent.session)?.turn.turnStartSeq === event.seq) {
+      queueMicrotask(() => { release(); release = agent.setGuardedClaimCoordinator!(tracked) })
+    }
+    if (event.type === 'turn/end' && event.data.reason.kind === 'error') ended.resolve()
+  })
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }); release() })
+  await agent.guardedSend(input, 'next-turn', 'changed-generation-after')
+  await ended.promise
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(adapter.requests).toHaveLength(0)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  release()
+  await handle.dispose()
+})
+
+it('rejects an unpaired start callback before installing a coordinator', async () => {
+  const { ctx } = await setup()
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-unpaired'), agentOptions: options })
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: () => {} },
+  )
+  expect(() => handle.agent.setGuardedClaimCoordinator!(authority)).toThrow(/callbacks must be installed together/)
+  await handle.dispose()
+})
+
+it('does not start or claim when a provisional callback returns a Promise', async () => {
+  const { ctx, adapter } = await setup()
+  const cleaned = Promise.withResolvers<void>()
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: async () => {}, cancelTurnStart: () => { cleaned.resolve() } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-async-callback'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded send unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(input, 'next-turn', 'async-registration')
+  await cleaned.promise
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+  expect(adapter.requests).toHaveLength(0)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  dispose()
+  await handle.dispose()
+})
+
+it('fences the Agent if a provisional callback returns a non-Promise thenable', async () => {
+  const { ctx, adapter } = await setup()
+  const cleaned = Promise.withResolvers<void>()
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeTurnStart: () => ({ then: () => {} }), cancelTurnStart: () => { cleaned.resolve() } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-thenable'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded send unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  await agent.guardedSend(input, 'next-turn', 'thenable-registration')
+  await cleaned.promise
+  await agent.whenIdle()
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(adapter.requests).toHaveLength(0)
+  dispose()
+  await handle.dispose()
+})
+
+it('keeps a provisional route unresolved when pre-step rejects after guarded claim', async () => {
+  const { ctx, adapter } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-after-claim-reject'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded send unavailable')
+  ctx.on('agent/pre-step', async (_payload, next) => {
+    await next()
+    return { kind:'reject' }
+  })
+  const input = createUserMessage({ content:[{ type:'text', text:'task' }], source:{ kind:'user' } })
+  await agent.guardedSend(input, 'next-turn', 'post-claim-reject')
+  await agent.whenIdle()
+  expect(starts.get(agent.session)?.input.message.id).toBe(input.id)
+  expect(agent.inbox.nextTurn).toHaveLength(0)
+  expect(agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === input.id)).toBe(false)
+  expect(adapter.requests).toHaveLength(0)
+  dispose()
+  await handle.dispose()
+})
+
+it('preserves a maintenance wake when cancel retains its queued input', async () => {
+  const { ctx, adapter } = await setup()
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-maintenance-wake'), agentOptions: options })
+  const { agent } = handle
+  const release = Promise.withResolvers<void>()
+  onTestFinished(() => { release.resolve() })
+  const maintenance = agent.runMaintenance(async () => { await release.promise })
+  agent.followup(createUserMessage({ content:[{ type:'text', text:'ordinary' }], source:{ kind:'user' } }))
+  agent.cancel({ kind:'user' }, { keepInbox:true })
+  release.resolve()
+  await maintenance
+  await agent.whenIdle()
+  expect(adapter.requests).toHaveLength(1)
+  expect(agent.inbox.nextTurn).toHaveLength(0)
+  await handle.dispose()
+})
+
+it('leaves all inputs queued if the guarded start candidate changes before claim', async () => {
+  const { ctx, adapter } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-changed'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded start unavailable')
+  const guarded = createUserMessage({ content:[{ type:'text', text:'guarded' }], source:{ kind:'user' } })
+  const added = createUserMessage({ content:[{ type:'text', text:'new ordinary input' }], source:{ kind:'user' } })
+  const direct = createUserMessage({ content:[{ type:'text', text:'direct inbox input' }], source:{ kind:'user' } })
+  let injected = false
+  const entered = Promise.withResolvers<void>()
+  const directDone = Promise.withResolvers<void>()
+  const parked = Promise.withResolvers<void>()
+  const admissions = Reflect.get(agent, 'admissions') as { waitForChange(signal:AbortSignal):Promise<void> }
+  const waitForChange = admissions.waitForChange.bind(admissions)
+  const waitSpy = vi.spyOn(admissions, 'waitForChange').mockImplementation((signal) => { parked.resolve(); return waitForChange(signal) })
+  onTestFinished(() => { waitSpy.mockRestore() })
+  let ordinaryTurn: number | undefined
+  let directTurn: number | undefined
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    if (decision.kind === 'enter' && decision.messages.some(message => message.id === added.id)) ordinaryTurn = payload.turn
+    if (decision.kind === 'enter' && decision.messages.some(message => message.id === direct.id)) directTurn = payload.turn
+    return decision
+  })
+  ctx.on('session/event', (session, event) => {
+    if (session === agent.session && event.type === 'turn/end' && event.data.turn === ordinaryTurn && event.data.reason.kind === 'completed') entered.resolve()
+    if (session === agent.session && event.type === 'turn/end' && event.data.turn === directTurn && event.data.reason.kind === 'completed') directDone.resolve()
+    if (session !== agent.session || event.type !== 'turn/start' || starts.get(agent.session)?.turn.turnStartSeq !== event.seq) return
+    queueMicrotask(() => { injected = true; agent.steer(added) })
+  })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(guarded, 'next-turn', 'changed-start')
+  await entered.promise
+  expect(injected).toBe(true)
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([guarded.id])
+  expect(agent.inbox.nextStep).toHaveLength(0)
+  await parked.promise
+  agent.inbox.prepend('next-step', direct)
+  await directDone.promise
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([guarded.id])
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  expect(adapter.requests).toHaveLength(2)
+  dispose()
+  await handle.dispose()
+})
+
+it('does not auto-wake retained inputs after disposal at the failed turn ending', async () => {
+  const { ctx, adapter } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-dispose'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded start unavailable')
+  const guarded = createUserMessage({ content:[{ type:'text', text:'guarded' }], source:{ kind:'user' } })
+  const added = createUserMessage({ content:[{ type:'text', text:'ordinary' }], source:{ kind:'user' } })
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session) return
+    if (event.type === 'turn/start' && starts.get(agent.session)?.turn.turnStartSeq === event.seq) queueMicrotask(() => agent.steer(added))
+    if (event.type === 'turn/end' && event.data.reason.kind === 'error') agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(guarded, 'next-turn', 'dispose-at-end')
+  await agent.whenIdle()
+  expect(adapter.requests).toHaveLength(0)
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([guarded.id])
+  expect(agent.inbox.nextStep.map(item => item.id)).toEqual([added.id])
+  dispose()
+  await handle.dispose()
+})
+
+it('does not mutate admission state when synchronous cancellation cannot append its event', async () => {
+  const { ctx } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-cancel'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded start unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'guarded' }], source:{ kind:'user' } })
+  let failed = false
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session || event.type !== 'turn/start' || starts.get(agent.session)?.turn.turnStartSeq !== event.seq) return
+    try { agent.cancel({ kind:'user' }) } catch { failed = true }
+  })
+  await agent.guardedSend(input, 'next-turn', 'cancel-at-start')
+  await agent.whenIdle()
+  expect(failed).toBe(true)
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'agent/admission/cancel' && event.data.messageId === input.id)).toBe(false)
+  await ctx.sessionPersistence.flushLiveSession(agent.id)
+  expect(await agent.inspectGuardedAdmission!(agent.id, input, 'next-turn', 'cancel-at-start'))
+    .toEqual({ decision:'unknown', observed:{ pending:true, admission:'released' } })
+  dispose()
+  await handle.dispose()
+})
+
+it('parks the input when guarded cancellation is attempted during start publication', async () => {
+  const { ctx } = await setup()
+  const { starts, tracked } = trackedCoordinator()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => tracked)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-start-async-cancel'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined || agent.cancelGuardedAdmission === undefined) throw new Error('guarded start unavailable')
+  const input = createUserMessage({ content:[{ type:'text', text:'guarded' }], source:{ kind:'user' } })
+  let cancellation: Promise<void> | undefined
+  const started = Promise.withResolvers<void>()
+  ctx.on('session/event', (session, event) => {
+    if (session !== agent.session || event.type !== 'turn/start' || starts.get(agent.session)?.turn.turnStartSeq !== event.seq) return
+    cancellation = agent.cancelGuardedAdmission!(agent.id, input, 'next-turn', 'cancel-during-start')
+    void cancellation.catch(() => {})
+    started.resolve()
+  })
+  onTestFinished(() => { agent.cancel({ kind:'disposed' }, { keepInbox:true }) })
+  await agent.guardedSend(input, 'next-turn', 'cancel-during-start')
+  await started.promise
+  expect(cancellation).toBeDefined()
+  await expect(cancellation).rejects.toThrow()
+  expect(agent.inbox.nextTurn.map(item => item.id)).toEqual([input.id])
+  expect(agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === input.id)).toBe(false)
+  agent.cancel({ kind:'disposed' }, { keepInbox:true })
+  await agent.whenIdle()
+  dispose()
+  await handle.dispose()
+})
 
 it('binds each guarded claim to its actual turn-start event without changing the pre-step payload', async () => {
   const { ctx } = await setup()

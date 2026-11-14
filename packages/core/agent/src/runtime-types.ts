@@ -201,12 +201,27 @@ export interface GuardedClaimTurn { readonly turn: number; readonly turnStartSeq
  * commit its fenced transaction before returning `committed`. It calls `claim`
  * exactly once inside that transaction. Failure after claim is outcome-unknown.
  */
-export type GuardedClaimCoordinator = (
+export type GuardedClaimCoordinator = ((
   sessionId: string,
   inputs: readonly GuardedClaimInput[],
   claim: () => void,
   turn?: Readonly<GuardedClaimTurn>,
-) => 'committed'
+) => 'committed') & {
+  /**
+   * Register provisional routing before a guarded turn-start is appended; this synchronous callback must not append Session events and does not claim input.
+   * @param session - exact target Session instance, not just its id.
+   * @param input - frozen guarded input and admission identity.
+   * @param turn - expected turn and next event sequence.
+   */
+  beforeTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void
+  /**
+   * Synchronously remove or mark unknown the exact provisional route if its turn-start cannot be appended; do not append Session events.
+   * @param session - exact target Session instance, not just its id.
+   * @param input - frozen guarded input and admission identity.
+   * @param turn - expected turn and next event sequence.
+   */
+  cancelTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void
+}
 
 declare module './types.ts' {
   interface Agent {

@@ -73,6 +73,13 @@ export class AdmissionState {
 
   requiresRevalidation(messageId: string): boolean { return this.needsRevalidation.has(messageId) }
 
+  /** Park a released input after a pre-claim turn identity changes. */
+  requireRevalidation(messageId: string): void {
+    if (!this.identities.has(messageId) || this.held.has(messageId) || this.canceled.has(messageId)) return
+    this.needsRevalidation.add(messageId)
+    this.notifyChange()
+  }
+
   revalidate(messageId: string, admissionId: string): void {
     if (!this.needsRevalidation.has(messageId) || this.identities.get(messageId) !== admissionId
       || this.held.has(messageId) || this.canceled.has(messageId)) throw new Error('admission cannot be revalidated')
