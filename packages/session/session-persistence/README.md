@@ -29,6 +29,8 @@ Mount one persistence backend to make sessions durable. The backend registers it
 
 `beginLiveEventReceipt(sessionId, type)` opens a bounded observation on the session's current writer. Confirm the exact observed event, then dispose the receipt; confirmation proves that event was durably stored, not that the associated work completed. Unsupported backends, missing or replaced writers, and failed confirmation leave the outcome unknown. This API does not itself gate Agent execution.
 
+`flushLiveSession(sessionId)` drains and flushes that Session's current live writer without adding an event, and rejects if the backend does not support it or the writer is missing or replaced. Capture the live Session identity and sequence before the call and check the identity afterward when using it to read a fixed durable prefix; this barrier does not establish whether an external effect happened.
+
 ### Choosing a backend
 
 The seam ships the [JSONL](../session-persistence-jsonl/README.md) backend: one append-only `.jsonl.zstd` log per session. A third-party backend may implement the service directly; the [backend contract](#understand-the-implementation) below is what it must honor.

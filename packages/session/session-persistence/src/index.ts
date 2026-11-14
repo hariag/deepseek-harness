@@ -211,6 +211,18 @@ export abstract class SessionPersistence extends Service {
   }
 
   /**
+   * Drain and flush the current live writer of one Session without appending an
+   * event. A caller that needs a fixed prefix must capture the live Session's
+   * sequence before this call and verify its identity remains unchanged after it.
+   * Unsupported backends and missing or replaced writers reject.
+   * @param _id - the live Session whose current writer must be flushed.
+   * @returns after the same live writer has durably flushed its accepted prefix.
+   */
+  flushLiveSession(_id: SessionId): Promise<void> {
+    return Promise.reject(new Error('Live Session flush is unsupported by this persistence backend'))
+  }
+
+  /**
    * Observe one stored session without reading its event log or taking
    * ownership.
    *

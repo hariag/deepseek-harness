@@ -29,6 +29,8 @@ kind: "package-reference"
 
 `beginLiveEventReceipt(sessionId, type)` 在该会话的当前写入器上开启有界观察。确认实际观察到的完整事件，并在结束后释放回执；确认成功只证明该事件已持久化，不表示相关工作已经完成。后端不支持、写入器缺失或更换、确认失败时，结果仍是未知。此 API 本身不会阻止 Agent 执行。
 
+`flushLiveSession(sessionId)` 排空并刷新指定会话的当前实时写入器，不追加事件；后端不支持、写入器缺失或更换时拒绝。需要读取固定持久前缀时，调用前记录实时 Session 的身份和序号，并在调用后核对身份；该屏障不能证明外部副作用是否发生。
+
 ### 选择后端
 
 seam 随产品交付 [JSONL](../session-persistence-jsonl/README.zh.md) 后端。它为每个会话存储一份仅追加的 `.jsonl.zstd` 日志。第三方后端可以直接实现该服务；必须遵守的[后端约定](#understand-the-implementation)见下文。

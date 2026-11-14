@@ -79,3 +79,44 @@ it('refuses confirmation if the receipt is disposed while a flush is pending', a
     await expect(confirmation).rejects.toThrow(/uncertain/)
   } finally { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) }
 })
+
+it('flushes the selected live writer and refuses a missing writer', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-live-prefix-'))
+  const ctx = new Context()
+  try {
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(Jsonl, { root, compression: 'none' })
+    const id = SessionId('live-prefix'), session = ctx.sessions.create(id)
+    await expect(ctx.sessionPersistence.flushLiveSession(id)).rejects.toThrow(/no live writer/)
+    const writer = await ctx.sessionPersistence.create(session.header)
+    const event = session.append('turn/start', { turn: 1 })
+    await ctx.sessionPersistence.flushLiveSession(id)
+    const reader = await ctx.sessionPersistence.open(id, 'read')
+    try { expect((await reader.read(event.seq, 1)).events).toEqual([event]) } finally { await reader.close() }
+    await writer.close()
+    await expect(ctx.sessionPersistence.flushLiveSession(id)).rejects.toThrow(/no live writer/)
+  } finally { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+it('does not confirm a live writer which closes while the flush is waiting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-live-prefix-close-'))
+  const ctx = new Context()
+  try {
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(Jsonl, { root, compression: 'none' })
+    const id = SessionId('live-prefix-close'), session = ctx.sessions.create(id)
+    const writer = await ctx.sessionPersistence.create(session.header)
+    session.append('turn/start', { turn: 1 })
+    let release!: () => void
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const hold = new Promise<void>(resolve => { release = resolve })
+    const original = writer.flush.bind(writer)
+    vi.spyOn(writer, 'flush').mockImplementationOnce(async options => { entered(); await hold; await original(options) })
+    const flushing = ctx.sessionPersistence.flushLiveSession(id)
+    await ready
+    await writer.close()
+    release()
+    await expect(flushing).rejects.toThrow()
+  } finally { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) }
+})

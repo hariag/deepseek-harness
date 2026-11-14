@@ -584,6 +584,15 @@ export class JsonlBackendTracker {
     if (errors.length > 0) throw new AggregateError(errors, `${this.name} flush failed`)
   }
 
+  /** Flush one live writer, refusing to confirm after ownership changes. */
+  async flushLiveSession(id: SessionId): Promise<void> {
+    const writer = this.writers.get(id)
+    if (writer === undefined || writer === null) throw new Error(`no live writer for session "${id}"`)
+    await writer.drainLive()
+    await writer.flush()
+    if (this.writers.get(id) !== writer) throw new Error(`session "${id}" writer changed during flush`)
+  }
+
   /** Start an observation bound to the current writer, rejecting replacement. */
   beginLiveEventReceipt(id: SessionId, type: string): SessionLiveEventReceipt {
     const writer = this.writers.get(id)
