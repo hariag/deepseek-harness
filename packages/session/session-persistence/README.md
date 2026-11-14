@@ -28,6 +28,7 @@ This package lets applications persist and resume session event logs through a b
 Mount one persistence backend to make sessions durable. The backend registers itself as `ctx.sessionPersistence` and routes every published session's live events into that session's active write handle; agent-loop — the production publication point for sessions — acquires each session's write handle before publication, so nothing else in the composition changes.
 
 `flushLiveSession(sessionId)` drains and flushes that Session’s current live writer without adding an event, rejecting unsupported backends or missing, closed or replaced writers. To read a fixed durable prefix, callers must capture and recheck the live Session identity and sequence; this barrier does not establish that external side effects occurred.
+`beginLiveEventReceipt(sessionId, type)` opens a bounded observation on the session's current writer. Confirm the exact observed event, then dispose the receipt; confirmation proves that event was durably stored, not that the associated work completed. Unsupported backends, missing or replaced writers, and failed confirmation leave the outcome unknown. This API does not itself gate Agent execution.
 
 ### Choosing a backend
 

@@ -340,6 +340,8 @@ The shipped provider implements the abstract `SessionPersistence` contract (`cre
 
 - **[dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl)** — an append-only logical JSONL log per session, stored as checksummed concatenated Zstandard frames by default or raw lines by configuration, with crash-safe atomic materialization, per-batch `fsync` appends, and torn-tail truncation before the first new append. `stat`/`list` carry `sizeBytes` and a best-effort `fs.stat`-derived revision.
 
+`SessionLiveEventReceipt` observes a particular event type on the current writer. `confirm(event)` verifies that exact routed event has reached durable storage; `dispose()` releases the observation. A closed or replaced writer and unsupported backends reject confirmation. Open the receipt before the event occurs.
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -408,6 +410,16 @@ abstract flush(): Promise<void>
  * @throws when unsupported, or when the writer is missing, closes or changes.
  */
 flushLiveSession(_id: SessionId): Promise<void>
+
+/**
+ * Observe an event type on the session's current live writer. Unsupported
+ * backends reject; confirmation is evidence of persistence, not business
+ * completion. Dispose the receipt when the observation is no longer needed.
+ * @param _id - the live session's id.
+ * @param _type - event type to observe.
+ * @returns a bounded writer-specific confirmation handle.
+ */
+beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt
 
 /**
  * Observe one stored session without reading its event log or taking

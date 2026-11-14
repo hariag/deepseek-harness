@@ -340,6 +340,8 @@ interface SessionPersistenceSnapshot {
 
 - **[dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl)**——逐会话仅追加的逻辑 JSONL 日志，默认存储为带 checksum 的连续 Zstandard frame，也可配置为原始行；具备崩溃安全的原子实体化、逐批 `fsync` 的 append，以及在第一次新 append 之前截断撕裂尾部。`stat`/`list` 携带 `sizeBytes` 与尽力而为的、由 `fs.stat` 派生的修订号。
 
+`SessionLiveEventReceipt` 在当前写入器上观察指定事件类型。`confirm(event)` 核实该条经路由的事件已持久化，`dispose()` 释放观察。写入器关闭或更换、后端不支持时，确认会失败。必须在事件发生前打开收据。
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -408,6 +410,16 @@ abstract flush(): Promise<void>
  * @throws when unsupported, or when the writer is missing, closes or changes.
  */
 flushLiveSession(_id: SessionId): Promise<void>
+
+/**
+ * Observe an event type on the session's current live writer. Unsupported
+ * backends reject; confirmation is evidence of persistence, not business
+ * completion. Dispose the receipt when the observation is no longer needed.
+ * @param _id - the live session's id.
+ * @param _type - event type to observe.
+ * @returns a bounded writer-specific confirmation handle.
+ */
+beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt
 
 /**
  * Observe one stored session without reading its event log or taking
