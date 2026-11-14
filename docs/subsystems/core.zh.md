@@ -81,6 +81,8 @@ interface Agent {
   readonly durableAdmissionVersion?: 1
   /** Capability declaration: guarded claims include their actual turn identity. */
   readonly guardedClaimTurnVersion?: 1
+  /** Capability declaration: guarded model attempts can be checked at the final frozen request boundary. */
+  readonly guardedRequestBoundaryVersion?: 1
 
   /**
  * Clear queued and steering work — unless `keepInbox` — and abort the active

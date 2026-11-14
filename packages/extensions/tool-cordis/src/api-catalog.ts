@@ -7160,7 +7160,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'GuardedClaimCoordinator',
-    declaration: 'export type GuardedClaimCoordinator = ((sessionId: string, inputs: readonly GuardedClaimInput[], claim: () => void, turn?: Readonly<GuardedClaimTurn>) => \'committed\') & {\n    beforeTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void;\n    cancelTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void;\n};',
+    declaration: 'export type GuardedClaimCoordinator = ((sessionId: string, inputs: readonly GuardedClaimInput[], claim: () => void, turn?: Readonly<GuardedClaimTurn>) => \'committed\') & {\n    beforeTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void;\n    beforeModelRequest?: (session: Session, request: Readonly<GenerateOptions>, position: Readonly<{\n        turn: number;\n        step: number;\n    }>) => boolean;\n    cancelTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void;\n};',
   },
   {
     name: 'GuardedClaimInput',
