@@ -56,6 +56,12 @@ export interface SessionLiveEventReceipt {
   dispose(): void
 }
 
+/** The result of one scoped write-open validation operation. */
+export interface SessionWriteOpenValidationResult<T> {
+  readonly value: T
+  readonly validated: boolean
+}
+
 /**
  * Lightweight stored-session observation returned by {@link SessionPersistence.stat}
  * and {@link SessionPersistence.list} without reading the full event log.
@@ -209,6 +215,19 @@ export abstract class SessionPersistence extends Service {
    */
   flushLiveSession(_id: SessionId): Promise<void> {
     return Promise.reject(new Error('Live Session flush is unsupported by this persistence backend'))
+  }
+
+  /**
+   * Validate every write open after acquiring its lease and before repair.
+   * @param _validate - checks the exclusively leased event snapshot.
+   * @param _operation - the operation that opens the writer.
+   * @returns the operation result and whether a writer was validated.
+   */
+  withWriteOpenValidation<T>(
+    _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>,
+    _operation: () => Promise<T>,
+  ): Promise<SessionWriteOpenValidationResult<T>> {
+    return Promise.reject(new Error('Scoped write-open validation is unsupported by this persistence backend'))
   }
 
   /**

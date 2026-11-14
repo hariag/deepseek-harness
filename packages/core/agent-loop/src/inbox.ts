@@ -6,7 +6,7 @@
 
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
-import type { Session, SessionEventMap, UserMessage } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEventInput, SessionEventMap, UserMessage } from '@deepseek-ai/dsh-session'
 import type {
   AgentEventDispatch,
   Inbox as InboxContract,
@@ -71,10 +71,13 @@ export const inboxProjectionDefinition = {
  * @param dispatch - agent-scoped notifications for Inbox lifecycle events.
  */
 export class ReactLoopInbox implements InboxContract {
+  private guardedInsertion: string | undefined
   constructor(
     private readonly readState: () => InboxState,
     private readonly session: Session,
     private readonly dispatch: AgentEventDispatch,
+    private readonly isHeld: (messageId: string) => boolean = () => false,
+    private readonly wasGuarded: (messageId: string) => boolean = () => false,
   ) {}
 
   /** Prompts awaiting individual turns. */
@@ -95,8 +98,17 @@ export class ReactLoopInbox implements InboxContract {
 
   /** Durably cancel all pending input, clearing next-step before next-turn. */
   clear(): void {
-    this.splice('next-step', 0, this.nextStep.length, [])
-    this.splice('next-turn', 0, this.nextTurn.length, [])
+    for (const target of ['next-step', 'next-turn'] as const) {
+      const items = this.readState()[target]
+      if (!items.some(message => this.isHeld(message.id))) {
+        this.splice(target, 0, items.length, [])
+        continue
+      }
+      for (let index = items.length - 1; index >= 0; index--) {
+        const message = this.readState()[target][index]
+        if (message !== undefined && !this.isHeld(message.id)) this.splice(target, index, 1, [])
+      }
+    }
   }
 
   /**
@@ -112,6 +124,27 @@ export class ReactLoopInbox implements InboxContract {
     return claimed
   }
 
+  /** Claim selected step input and an optional queued turn atomically. */
+  claimSelected(stepIndices: readonly number[], takeTurn: boolean, turn: number): UserMessage[] {
+    const state = this.readState()
+    if (stepIndices.some((index, at) => !Number.isSafeInteger(index) || index < 0 || index >= state['next-step'].length || (at > 0 && index <= (stepIndices[at - 1] ?? -1)))
+      || (takeTurn && state['next-turn'].length === 0)) {
+      throw new Error('selected inbox input changed')
+    }
+    if (stepIndices.length === 0 && !takeTurn) return []
+    const selected = new Set(stepIndices)
+    const nextStep = state['next-step'].filter((_message, index) => selected.has(index))
+    const nextTurn = takeTurn ? state['next-turn'].slice(0, 1) : []
+    const claimed = [...nextStep, ...nextTurn]
+    if (claimed.some(message => this.isHeld(message.id))) throw new Error('cannot claim an unresolved admission')
+    const events: SessionEventInput[] = []
+    for (const index of [...stepIndices].reverse()) events.push(['agent/inbox/spliced', { target: 'next-step', start: index, removedCount: 1, inserted: [] }])
+    if (nextTurn.length > 0) events.push(['agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] }])
+    this.session.append(events)
+    for (const message of claimed) this.dispatch.emit('agent/inbox/claimed', { message, turn })
+    return claimed
+  }
+
   /**
    * Append one message to a pending list.
    * @param target - pending list to extend.
@@ -119,6 +152,13 @@ export class ReactLoopInbox implements InboxContract {
    */
   append(target: InboxTarget, message: UserMessage): void {
     this.splice(target, this.readState()[target].length, 0, [message])
+  }
+
+  /** Insert the input whose hold was just established by this driver. */
+  insertGuarded(target: InboxTarget, message: UserMessage): void {
+    if (this.guardedInsertion !== undefined || !this.isHeld(message.id)) throw new Error('invalid guarded insertion')
+    this.guardedInsertion = message.id
+    try { this.splice(target, Infinity, 0, [message]) } finally { this.guardedInsertion = undefined }
   }
 
   /**
@@ -203,6 +243,9 @@ export class ReactLoopInbox implements InboxContract {
       inbox.length - actualStart,
     )
     if (actualDeleteCount === 0 && inserted.length === 0) return []
+    if (inserted.some(message => this.wasGuarded(message.id) && message.id !== this.guardedInsertion)) {
+      throw new Error('message identity belongs to a guarded admission')
+    }
     const candidate = inbox.toSpliced(actualStart, actualDeleteCount, ...inserted)
     const ids = new Set<string>()
     for (const message of target === 'next-turn'
@@ -220,6 +263,7 @@ export class ReactLoopInbox implements InboxContract {
       ...(outcome === undefined ? {} : { outcome }),
     }
     const removed = inbox.slice(actualStart, actualStart + actualDeleteCount)
+    if (removed.some(message => this.isHeld(message.id))) throw new Error('cannot remove an input with an unresolved admission')
     const event = this.session.append('agent/inbox/spliced', splice)
     if (discardRemoved) {
       for (const message of removed) this.dispatch.emit('agent/inbox/discarded', { message })

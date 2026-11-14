@@ -14,6 +14,8 @@ import type {
   ModelSelection,
   ModelSelectionProjectionState,
   InboxTarget,
+  GuardedClaimCoordinator,
+  GuardedClaimInput,
   InboxState,
   PreStepDecision,
   RequestErrorAction,
@@ -27,17 +29,20 @@ import {
   errorChain,
   markAgentLoopRequest,
 } from '@deepseek-ai/dsh-llm'
-import { assertNever, deepFreeze } from '@deepseek-ai/dsh-util-values'
+import { assertNever, deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
+import { isDeepStrictEqual } from 'node:util'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import { createScope } from '@deepseek-ai/dsh-scope'
-import type { EpochHeader, RequestContext, Session, SessionId, SessionSeq, TurnEndReason, UserMessage } from '@deepseek-ai/dsh-session'
+import type { EpochHeader, RequestContext, Session, SessionEvent, SessionId, SessionSeq, TurnEndReason, UserMessage } from '@deepseek-ai/dsh-session'
 import { canonicalHeader, headerEquals, ToolCallRecovery } from '@deepseek-ai/dsh-session'
 import { renderContextSections, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { ToolActivationError, ToolBatchExecutionError } from '@deepseek-ai/dsh-tools'
 import type { ResolvedToolSet } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
-import { ReactLoopInbox } from './inbox.ts'
+import { inboxProjectionDefinition, ReactLoopInbox } from './inbox.ts'
+import { AdmissionState } from './admission.ts'
 import { RuntimeContextProjection } from './runtime-context.ts'
 import { AssistantStreamAttempt } from './assistant-stream.ts'
 import { SystemPromptProjection } from './runtime-context.ts'
@@ -61,6 +66,9 @@ type Phase =
   | { kind: 'running'; abort: AbortController; turn: number; step: number; wakeRequested: boolean }
 
 type StepEndReason = Extract<TurnEndReason, { kind: 'completed' | 'max-tokens' }>
+type TurnKind = 'initial' | 'ordinary' | 'guarded'
+interface StoppingInputs { readonly turn: number; readonly ids: Set<string>; open: boolean }
+interface ProposedInput { message: UserMessage; target: InboxTarget; index: number }
 
 type PreparedStep =
   | { kind: 'reject' }
@@ -68,6 +76,8 @@ type PreparedStep =
     kind: 'enter'
     messages: UserMessage[]
     startsRequestSeries?: true
+    /** The claimed input belongs to a guarded task with its own turn. */
+    claimedGuarded: boolean
     assembly: PromptAssembly
     selection: Readonly<ModelSelection>
     /** Admission shared by the step's declarations and dispatch; the turn disposes it after the step. */
@@ -110,8 +120,23 @@ function abortedCancelCause(signal: AbortSignal): AgentCancelCause | undefined {
 
 /** Drives one session through turn and step boundaries. */
 export class ReactLoopAgent implements Agent {
+  readonly durableAdmissionVersion = 1 as const
+  readonly guardedClaimTurnVersion = 1 as const
   readonly model: AgentModel
   readonly inbox: ReactLoopInbox
+  private readonly admissions: AdmissionState
+  private guardedClaimCoordinator: GuardedClaimCoordinator | undefined
+  private guardedCoordinatorReady: Promise<void> | undefined
+  private guardedCoordinatorToken: object | undefined
+  private guardedClaimFault = false
+  private allowedGuardedClaims: ReadonlySet<string> | undefined
+  private allowedGuardedDiscard: string | undefined
+  private readonly reconciling = new Set<string>()
+  private readonly removeAdmissionGuard: () => void
+  private allowedAdmissionEvent: { type: string; messageId: string; admissionId: string } | undefined
+  private allowedGuardedInput: UserMessage | undefined
+  private preserveGuardedDuringDisposal = false
+  private readonly stoppingInputs = new AsyncLocalStorage<StoppingInputs>()
   private phase: Phase
   private activityDone: Promise<void> = Promise.resolve()
 
@@ -148,7 +173,12 @@ export class ReactLoopAgent implements Agent {
     this.scope = createScope(loopCtx, this)
     this.ctx = this.scope.ctx
     this.model = new AgentModel(projections.modelSelection, session, options)
-    this.inbox = new ReactLoopInbox(projections.inbox, session, this.dispatch)
+    this.admissions = AdmissionState.fromRecords(loopCtx.agents.guardedAdmissionRecordsOf(session))
+    this.inbox = new ReactLoopInbox(projections.inbox, session, this.dispatch,
+      id => (this.admissions.hasHeld(id) && this.allowedGuardedDiscard !== id)
+        || (this.preserveGuardedDuringDisposal && this.admissions.hasSeen(id)),
+      id => this.admissions.hasSeen(id))
+    this.removeAdmissionGuard = session.registerAppendGuard((events) => { this.validateAdmissionBatch(events) })
     this.phase = { kind: 'idle', lastTurn }
     this.runtimeContext = new RuntimeContextProjection(this.ctx, session)
     this.systemPrompt = new SystemPromptProjection(session)
@@ -169,12 +199,320 @@ export class ReactLoopAgent implements Agent {
   }
 
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
+    if (this.admissions.hasSeen(message.id)) throw new Error('message identity belongs to a guarded admission')
+    this.sendUnchecked(message, target, wakeup)
+  }
+
+  private sendUnchecked(message: UserMessage, target: InboxTarget, wakeup: boolean, guarded = false): void {
     // Waking input cannot join an aborted activity, so it starts the next turn.
     // Captured before the insertion so a reentrant cancel from a splice observer cannot reclassify it.
     const wakingAfterAbort = wakeup && this.phase.kind !== 'idle' && this.phase.abort.signal.aborted
     const resolvedTarget = wakingAfterAbort ? 'next-turn' : target
-    this.inbox.splice(resolvedTarget, Infinity, 0, [message])
+    if (guarded && resolvedTarget !== target) throw new Error('guarded admission target changed')
+    const stopping = this.stoppingInputs.getStore()
+    const continuation = !guarded && resolvedTarget === 'next-step' && stopping?.open === true
+      && this.phase.kind === 'running' && this.phase.turn === stopping.turn ? stopping : undefined
+    continuation?.ids.add(message.id)
+    try {
+      if (guarded) this.inbox.insertGuarded(resolvedTarget, message)
+      else this.inbox.splice(resolvedTarget, Infinity, 0, [message])
+    } catch (error: unknown) {
+      continuation?.ids.delete(message.id)
+      throw error
+    }
     if (wakeup) this.wakeDriver(wakingAfterAbort)
+  }
+
+  /** Keep the guard installed until the Session is detached from its store. */
+  disposeAdmissionGuard(): void { this.removeAdmissionGuard() }
+
+  private validateAdmissionBatch(events: readonly SessionEvent[]): void {
+    const pending = {
+      'next-step': [...this.inbox.nextStep],
+      'next-turn': [...this.inbox.nextTurn],
+    }
+    for (const event of events) {
+      if (event.type === 'agent/admission/hold' || event.type === 'agent/admission/release' || event.type === 'agent/admission/cancel' || event.type === 'agent/admission/reconciled') {
+        const allowed = this.allowedAdmissionEvent
+        if (events.length !== 1 || allowed === undefined || event.type !== allowed.type
+          || event.data.messageId !== allowed.messageId || event.data.admissionId !== allowed.admissionId) {
+          throw new Error('unauthorized guarded admission event')
+        }
+        continue
+      }
+      if (event.type !== 'agent/inbox/spliced') continue
+      const splice = event.data
+      const queue = pending[splice.target]
+      // oxlint-disable-next-line typescript/no-unnecessary-condition -- untyped callers may violate the target type.
+      if (queue === undefined || !Number.isSafeInteger(splice.start) || splice.start < 0 || splice.start > queue.length
+        || !Number.isSafeInteger(splice.removedCount ?? 0) || (splice.removedCount ?? 0) < 0
+        || splice.start + (splice.removedCount ?? 0) > queue.length || !Array.isArray(splice.inserted)) {
+        throw new Error('invalid guarded inbox splice')
+      }
+      const removed = queue.slice(splice.start, splice.start + (splice.removedCount ?? 0))
+      if (removed.some(message => (this.admissions.hasHeld(message.id) && this.allowedGuardedDiscard !== message.id)
+        || (this.admissions.hasSeen(message.id) && !this.allowedGuardedClaims?.has(message.id) && this.allowedGuardedDiscard !== message.id)
+        || (this.preserveGuardedDuringDisposal && this.admissions.hasSeen(message.id)))) {
+        throw new Error('cannot remove an input with an unresolved admission')
+      }
+      if (splice.inserted.some(message => this.admissions.hasSeen(message.id)
+        && (this.allowedGuardedInput === undefined || !isDeepStrictEqual(message, this.allowedGuardedInput)))) {
+        throw new Error('message identity belongs to a guarded admission')
+      }
+      queue.splice(splice.start, splice.removedCount ?? 0, ...splice.inserted)
+    }
+  }
+
+  private appendAdmission(type: 'agent/admission/hold' | 'agent/admission/release' | 'agent/admission/cancel' | 'agent/admission/reconciled', messageId: string, admissionId: string): SessionEvent {
+    if (this.allowedAdmissionEvent !== undefined) throw new Error('nested guarded admission event')
+    this.allowedAdmissionEvent = { type, messageId, admissionId }
+    try {
+      switch (type) {
+        case 'agent/admission/hold': return this.session.append('agent/admission/hold', { messageId, admissionId })
+        case 'agent/admission/release': return this.session.append('agent/admission/release', { messageId, admissionId })
+        case 'agent/admission/cancel': return this.session.append('agent/admission/cancel', { messageId, admissionId })
+        case 'agent/admission/reconciled': return this.session.append('agent/admission/reconciled', { messageId, admissionId })
+      }
+    } finally { this.allowedAdmissionEvent = undefined }
+  }
+
+  setGuardedClaimCoordinator(coordinator: GuardedClaimCoordinator, ready?: Promise<void>): () => void {
+    if (typeof coordinator !== 'function' || this.guardedClaimCoordinator !== undefined || this.guardedClaimFault) {
+      throw new Error('guarded claim coordinator is unavailable or already installed')
+    }
+    this.guardedClaimCoordinator = coordinator
+    this.guardedCoordinatorReady = ready
+    const token = {}
+    this.guardedCoordinatorToken = token
+    try {
+      if ([...this.inbox.nextStep, ...this.inbox.nextTurn].some(message => this.admissions.hasSeen(message.id))) this.wakeDriver()
+    } catch (error: unknown) {
+      if (this.guardedCoordinatorToken === token) {
+        this.guardedClaimCoordinator = undefined
+        this.guardedCoordinatorReady = undefined
+        this.guardedCoordinatorToken = undefined
+        this.admissions.notifyChange()
+      }
+      throw error
+    }
+    let installed = true
+    return () => {
+      if (!installed) return
+      installed = false
+      if (this.guardedCoordinatorToken === token) {
+        this.guardedClaimCoordinator = undefined
+        this.guardedCoordinatorReady = undefined
+        this.guardedCoordinatorToken = undefined
+        this.admissions.notifyChange()
+      }
+    }
+  }
+
+  private failGuardedClaim(): void {
+    this.guardedClaimFault = true
+    this.admissions.notifyChange()
+  }
+
+  private async awaitGuardedCoordinator(signal: AbortSignal): Promise<void> {
+    const coordinator = this.guardedClaimCoordinator
+    const token = this.guardedCoordinatorToken
+    if (coordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+    const ready = this.guardedCoordinatorReady
+    if (ready !== undefined) {
+      let stop: (() => void) | undefined
+      const aborted = new Promise<never>((_resolve, reject) => {
+        // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- preserve the caller's exact AbortSignal reason.
+        stop = () => { reject(signal.reason) }
+        signal.addEventListener('abort', stop, { once: true })
+        if (signal.aborted) stop()
+      })
+      try { await Promise.race([ready, aborted]) } finally {
+        if (stop !== undefined) signal.removeEventListener('abort', stop)
+      }
+    }
+    signal.throwIfAborted()
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- coordinator state can change while awaiting readiness.
+    if (this.guardedCoordinatorToken !== token || this.guardedClaimFault) throw new Error('guarded claim coordinator changed')
+  }
+
+  async guardedSend(message: UserMessage, target: InboxTarget, admissionId: string): Promise<void> {
+    if (this.guardedClaimCoordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+    if (target === 'next-step' && this.phase.kind !== 'idle' && this.phase.abort.signal.aborted) {
+      throw new Error('guarded admission target changed')
+    }
+    const input = snapshotJsonValue(message)
+    if (input === undefined || typeof input.id !== 'string' || input.id === '' || typeof admissionId !== 'string' || admissionId === '') {
+      throw new Error('invalid guarded admission input')
+    }
+    if (this.admissions.hasSeen(input.id) || [...this.inbox.nextStep, ...this.inbox.nextTurn].some(item => item.id === input.id)) {
+      throw new Error('guarded message identity is already in use')
+    }
+    const persistence = this.loopCtx.get('sessionPersistence')
+    if (persistence === undefined) throw new Error('guarded admission requires session persistence')
+    const insertionReceipt = persistence.beginLiveEventReceipt(this.session.id, 'agent/inbox/spliced')
+    let releaseReceipt: ReturnType<typeof persistence.beginLiveEventReceipt> | undefined
+    let insertion: SessionEvent | undefined
+    let ambiguous = false
+    let stop: (() => void) | undefined
+    try {
+      stop = this.loopCtx.on('session/event', (session, event) => {
+        if (session !== this.session || event.type !== 'agent/inbox/spliced') return
+        const matching = event.data.inserted.filter(item => item.id === input.id)
+        if (matching.length === 0) return
+        if (matching.length !== 1 || insertion !== undefined || !isDeepStrictEqual(matching[0], input)) ambiguous = true
+        else insertion = event
+      })
+      releaseReceipt = persistence.beginLiveEventReceipt(this.session.id, 'agent/admission/release')
+      this.admissions.assertNew(input.id, admissionId)
+      this.appendAdmission('agent/admission/hold', input.id, admissionId)
+      this.admissions.hold(input.id, admissionId)
+      this.allowedGuardedInput = input
+      try { this.sendUnchecked(input, target, true, true) } finally { this.allowedGuardedInput = undefined }
+      // oxlint-disable-next-line typescript/no-unnecessary-condition -- the event observer updates this during synchronous publication.
+      if (ambiguous || insertion === undefined) throw new Error('guarded insertion outcome is unknown')
+      await insertionReceipt.confirm(insertion)
+      if (this.admissions.isCanceled(input.id)) throw new Error('guarded admission was canceled')
+      const release = this.appendAdmission('agent/admission/release', input.id, admissionId)
+      await releaseReceipt.confirm(release)
+      if (this.admissions.isCanceled(input.id)) throw new Error('guarded admission was canceled')
+      this.admissions.release(input.id, admissionId)
+    } finally {
+      try { stop?.() } finally {
+        try { insertionReceipt.dispose() } finally { releaseReceipt?.dispose() }
+      }
+    }
+  }
+
+  async inspectGuardedAdmission(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<{
+    decision: 'unknown'
+    observed?: { pending: true; admission: 'held' | 'released' | 'canceled' }
+  }> {
+    const unknown = { decision: 'unknown' } as const
+    try {
+      if (sessionId !== this.session.id || typeof admissionId !== 'string' || admissionId === '') return unknown
+      const expected = snapshotJsonValue(message)
+      if (expected === undefined || typeof expected.id !== 'string' || expected.id === '') return unknown
+      // oxlint-disable-next-line typescript/no-unnecessary-condition -- this public boundary also checks untyped callers.
+      if (target !== 'next-step' && target !== 'next-turn') return unknown
+      const persistence = this.loopCtx.get('sessionPersistence')
+      if (persistence === undefined) return unknown
+      const handle = await persistence.open(this.session.id, 'read')
+      try {
+        const events = (await handle.read()).events
+        const state = new AdmissionState(events)
+        if (state.admissionId(expected.id) !== admissionId) return unknown
+        let insertionCount = 0
+        let admission: 'held' | 'released' | 'canceled' = 'held'
+        let inbox: InboxState = inboxProjectionDefinition.init()
+        for (const event of events) {
+          if (event.type === 'user/message' && event.data.id === expected.id) return unknown
+          if ((event.type === 'agent/admission/release' || event.type === 'agent/admission/cancel')
+            && event.data.messageId === expected.id && event.data.admissionId === admissionId) {
+            admission = event.type === 'agent/admission/release' ? 'released' : 'canceled'
+          }
+          if (event.type === 'agent/inbox/spliced') {
+            for (const inserted of event.data.inserted) {
+              if (inserted.id !== expected.id) continue
+              if (++insertionCount !== 1 || event.data.target !== target || !isDeepStrictEqual(inserted, expected)) return unknown
+            }
+          }
+          inbox = inboxProjectionDefinition.apply(inbox, event)
+        }
+        if (insertionCount !== 1 || !inbox[target].some(item => isDeepStrictEqual(item, expected))) return unknown
+        const current = target === 'next-step' ? this.inbox.nextStep : this.inbox.nextTurn
+        if (!current.some(item => isDeepStrictEqual(item, expected))) return unknown
+        return { decision: 'unknown', observed: { pending: true, admission } }
+      } finally { await handle.close() }
+    } catch {
+      // Missing, malformed, or inaccessible storage never authorizes a retry.
+      return unknown
+    }
+  }
+
+  async reconcileGuardedAdmission(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void> {
+    if (this.guardedClaimCoordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+    const expected = snapshotJsonValue(message)
+    if (expected === undefined || sessionId !== this.session.id || !this.admissions.requiresRevalidation(expected.id)
+      || this.admissions.admissionId(expected.id) !== admissionId || this.reconciling.has(expected.id)) {
+      throw new Error('admission cannot be reconciled')
+    }
+    this.reconciling.add(expected.id)
+    let appended = false
+    try {
+      const first = await this.inspectGuardedAdmission(sessionId, expected, target, admissionId)
+      if (first.observed === undefined || first.observed.admission === 'canceled') throw new Error('admission outcome is unknown')
+      if (!await this.loopCtx.sessions.flush(this.session)) throw new Error('admission has no durability listener')
+      const checked = await this.inspectGuardedAdmission(sessionId, expected, target, admissionId)
+      if (checked.observed === undefined || checked.observed.admission === 'canceled' || this.admissions.isCanceled(expected.id)) {
+        throw new Error('admission changed before reconciliation')
+      }
+      const persistence = this.loopCtx.get('sessionPersistence')
+      if (persistence === undefined) throw new Error('admission persistence is unavailable')
+      const eventType = checked.observed.admission === 'held' ? 'agent/admission/release' : 'agent/admission/reconciled'
+      const receipt = persistence.beginLiveEventReceipt(this.session.id, eventType)
+      try {
+        if (this.admissions.isCanceled(expected.id)) throw new Error('admission was canceled')
+        const event = this.appendAdmission(eventType, expected.id, admissionId)
+        appended = true
+        await receipt.confirm(event)
+        const pending = target === 'next-step' ? this.inbox.nextStep : this.inbox.nextTurn
+        if (this.admissions.isCanceled(expected.id) || !pending.some(item => isDeepStrictEqual(item, expected))) {
+          throw new Error('admission changed during reconciliation')
+        }
+        if (eventType === 'agent/admission/release') this.admissions.release(expected.id, admissionId)
+        this.admissions.revalidate(expected.id, admissionId)
+      } finally { receipt.dispose() }
+    } catch (error: unknown) {
+      if (appended) this.failGuardedClaim()
+      throw error
+    } finally { this.reconciling.delete(expected.id) }
+  }
+
+  async cancelGuardedAdmission(sessionId: string, message: UserMessage, target: InboxTarget, admissionId: string): Promise<void> {
+    const expected = snapshotJsonValue(message)
+    if (expected === undefined || sessionId !== this.session.id || this.admissions.admissionId(expected.id) !== admissionId
+      || this.reconciling.has(expected.id) || this.guardedClaimFault) throw new Error('guarded cancellation outcome is unknown')
+    const pending = (): readonly UserMessage[] => target === 'next-step' ? this.inbox.nextStep : this.inbox.nextTurn
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- this public boundary also checks untyped callers.
+    if ((target !== 'next-step' && target !== 'next-turn') || !pending().some(item => isDeepStrictEqual(item, expected))) {
+      throw new Error('guarded cancellation outcome is unknown')
+    }
+    const persistence = this.loopCtx.get('sessionPersistence')
+    if (persistence === undefined) throw new Error('guarded cancellation requires persistence')
+    const cancelReceipt = persistence.beginLiveEventReceipt(this.session.id, 'agent/admission/cancel')
+    let spliceReceipt: ReturnType<typeof persistence.beginLiveEventReceipt> | undefined
+    let stop: (() => void) | undefined
+    let appended = false
+    this.reconciling.add(expected.id)
+    try {
+      spliceReceipt = persistence.beginLiveEventReceipt(this.session.id, 'agent/inbox/spliced')
+      let removed: SessionEvent | undefined
+      let ambiguous = false
+      stop = this.loopCtx.on('session/event', (session, event) => {
+        if (session !== this.session || event.type !== 'agent/inbox/spliced' || event.data.outcome !== 'canceled') return
+        if (removed !== undefined) ambiguous = true
+        else removed = event
+      })
+      this.admissions.cancel(expected.id, admissionId)
+      const tombstone = this.appendAdmission('agent/admission/cancel', expected.id, admissionId)
+      appended = true
+      await cancelReceipt.confirm(tombstone)
+      if (!pending().some(item => isDeepStrictEqual(item, expected))) throw new Error('guarded cancellation outcome is unknown')
+      this.allowedGuardedDiscard = expected.id
+      try {
+        if (!this.inbox.remove(expected.id)) throw new Error('guarded cancellation outcome is unknown')
+      } finally { this.allowedGuardedDiscard = undefined }
+      // oxlint-disable-next-line typescript/no-unnecessary-condition -- the event observer updates this during synchronous publication.
+      if (ambiguous || removed === undefined) throw new Error('guarded cancellation removal is unknown')
+      await spliceReceipt.confirm(removed)
+      this.admissions.notifyChange()
+    } catch (error: unknown) {
+      if (appended) this.failGuardedClaim()
+      throw error
+    } finally {
+      this.reconciling.delete(expected.id)
+      try { stop?.() } finally { try { spliceReceipt?.dispose() } finally { cancelReceipt.dispose() } }
+    }
   }
 
   followup(input: UserMessage): void {
@@ -191,7 +529,18 @@ export class ReactLoopAgent implements Agent {
 
   cancel(cause: AgentCancelCause, options: CancelOptions = {}): void {
     try {
-      if (!options.keepInbox) this.inbox.clear()
+      if (!options.keepInbox) {
+        if (cause.kind !== 'disposed') {
+          for (const message of [...this.inbox.nextStep, ...this.inbox.nextTurn]) {
+            const admissionId = this.admissions.admissionId(message.id)
+            if (admissionId === undefined || this.admissions.isCanceled(message.id)) continue
+            this.admissions.cancel(message.id, admissionId)
+            this.appendAdmission('agent/admission/cancel', message.id, admissionId)
+          }
+        }
+        this.preserveGuardedDuringDisposal = cause.kind === 'disposed'
+        try { this.inbox.clear() } finally { this.preserveGuardedDuringDisposal = false }
+      }
     } finally {
       // Queue persistence must not prevent cancellation of admitted work.
       if (this.phase.kind !== 'idle') {
@@ -218,8 +567,11 @@ export class ReactLoopAgent implements Agent {
       } finally {
         this.setPhase({ kind: 'idle', lastTurn: maintenance.lastTurn })
         const cause = abortedCancelCause(maintenance.abort.signal)
-        if (cause?.kind !== 'disposed' && maintenance.wakeRequested && this.inbox.hasPending) this.wakeDriver()
-        done.resolve()
+        try {
+          if (cause?.kind !== 'disposed' && maintenance.wakeRequested && this.inbox.hasPending) this.wakeDriver()
+        } finally {
+          done.resolve()
+        }
       }
     })()
   }
@@ -245,15 +597,24 @@ export class ReactLoopAgent implements Agent {
       return
     }
     const driver = Promise.withResolvers<void>()
+    const lastTurn = this.phase.lastTurn
     this.activityDone = driver.promise
     this.setPhase({
       kind: 'running',
       abort: new AbortController(),
-      turn: this.phase.lastTurn,
+      turn: lastTurn,
       step: 0,
       wakeRequested: false,
     })
-    this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
+    try {
+      this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
+    } catch (error: unknown) {
+      // The initiator scope may close between the lifetime check and this
+      // boundary. No driver started, so restore idle and release all waiters.
+      this.setPhase({ kind: 'idle', lastTurn })
+      driver.resolve()
+      throw error
+    }
   }
 
   async whenIdle(): Promise<void> {
@@ -286,11 +647,94 @@ export class ReactLoopAgent implements Agent {
     }
   }
 
-  private async preStep(target: InboxTarget, position: { turn: number; step: number }): Promise<PreparedStep> {
+  private proposedClaim(target: InboxTarget, turnKind: TurnKind, continuationIds: ReadonlySet<string>): ProposedInput[] {
+    const proposed = [
+      ...this.inbox.nextStep.map((message, index) => ({ message, target: 'next-step' as const, index })),
+      ...(target === 'next-turn' ? this.inbox.nextTurn.slice(0, 1).map(message => ({ message, target: 'next-turn' as const, index: 0 })) : []),
+    ]
+    if (turnKind === 'guarded') return proposed.filter(item => item.target === 'next-step' && continuationIds.has(item.message.id))
+    const firstGuarded = proposed.findIndex(item => this.admissions.hasSeen(item.message.id))
+    if (firstGuarded < 0) return proposed
+    if (turnKind === 'ordinary') return proposed.filter((item, index) => index < firstGuarded
+      || (item.target === 'next-step' && continuationIds.has(item.message.id)))
+    return proposed.slice(0, firstGuarded === 0 ? 1 : firstGuarded)
+  }
+
+  private async preStep(
+    target: InboxTarget, position: { turn: number; step: number; turnStartSeq: number }, turnKind: TurnKind, continuationIds: Set<string>,
+  ): Promise<PreparedStep> {
     /* v8 ignore next -- private callers establish the running phase before proposing a step */
     if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": pre-step outside running phase`)
     const signal = this.phase.abort.signal
-    const claimed = this.inbox.claim(target, position.turn)
+    let proposed: ReturnType<ReactLoopAgent['proposedClaim']>
+    while (true) {
+      proposed = this.proposedClaim(target, turnKind, continuationIds)
+      const candidates = proposed.map(item => item.message.id)
+      if (this.admissions.isBlocked(candidates)) {
+        if (this.guardedClaimCoordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+        await this.admissions.waitForChange(signal)
+        continue
+      }
+      signal.throwIfAborted()
+      if (candidates.some(id => this.admissions.hasSeen(id))) {
+        await this.awaitGuardedCoordinator(signal)
+        if (!isDeepStrictEqual(proposed, this.proposedClaim(target, turnKind, continuationIds))) continue
+      }
+      break
+    }
+    const guarded: GuardedClaimInput[] = []
+    for (const item of proposed) {
+      const admissionId = this.admissions.admissionId(item.message.id)
+      if (admissionId !== undefined) {
+        const message = snapshotJsonValue(item.message)
+        if (message === undefined) throw new Error('guarded input is not lossless JSON')
+        guarded.push(deepFreeze({ admissionId, message, target: item.target }))
+      }
+    }
+    let claimed: UserMessage[]
+    const stepIndices = proposed.filter(item => item.target === 'next-step').map(item => item.index)
+    const takeTurn = proposed.some(item => item.target === 'next-turn')
+    const wholeBatch = stepIndices.length === this.inbox.nextStep.length
+      && takeTurn === (target === 'next-turn' && this.inbox.nextTurn.length > 0)
+    if (guarded.length === 0) {
+      claimed = wholeBatch ? this.inbox.claim(target, position.turn) : this.inbox.claimSelected(stepIndices, takeTurn, position.turn)
+    } else {
+      const coordinator = this.guardedClaimCoordinator
+      const token = this.guardedCoordinatorToken
+      if (coordinator === undefined || token === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+      const original = snapshotJsonValue(proposed)
+      if (original === undefined) throw new Error('guarded claim batch is not lossless JSON')
+      const allowed = new Set(guarded.map(item => item.message.id))
+      let called = false
+      let closed = false
+      let violated = false
+      let result: UserMessage[] | undefined
+      try {
+        const decision: unknown = coordinator(this.session.id, deepFreeze(guarded), () => {
+          if (closed || called) { violated = true; throw new Error('guarded claim called outside its single-use transaction') }
+          called = true
+          signal.throwIfAborted()
+          if (this.guardedCoordinatorToken !== token || this.guardedClaimFault) throw new Error('guarded claim coordinator changed')
+          const current = this.proposedClaim(target, turnKind, continuationIds)
+          if (!isDeepStrictEqual(current, original)) throw new Error('guarded claim batch changed during decision')
+          this.allowedGuardedClaims = allowed
+          try { result = this.inbox.claimSelected(stepIndices, takeTurn, position.turn) } finally { this.allowedGuardedClaims = undefined }
+        }, Object.freeze({ turn: position.turn, turnStartSeq: position.turnStartSeq }))
+        closed = true
+        if (decision instanceof Promise) void decision.catch(() => {})
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- the coordinator calls the claim callback reentrantly.
+        if (decision !== 'committed' || !called || violated || result === undefined) throw new Error('guarded claim decision was not committed')
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- the coordinator can synchronously detach or fault.
+        if (this.guardedCoordinatorToken !== token || this.guardedClaimFault) throw new Error('guarded claim coordinator changed')
+        signal.throwIfAborted()
+        claimed = result
+      } catch (error: unknown) {
+        closed = true
+        this.failGuardedClaim()
+        throw error
+      }
+    }
+    for (const message of claimed) continuationIds.delete(message.id)
     const selection = this.model.current()
     if (selection === undefined) {
       throw new Error(`agent "${this.id}" has no provider/model: set AgentOptions.provider and AgentOptions.model or record a model selection`)
@@ -300,7 +744,7 @@ export class ReactLoopAgent implements Agent {
       const assembly = await this.loopCtx.systemPrompt.assemble({ ...assembleContextFor(this, signal), modelSelection: selection, toolSet })
       signal.throwIfAborted()
       const decision = await this.dispatch.waterfall(
-        'agent/pre-step', { messages: claimed, ...position, signal, modelSelection: selection },
+        'agent/pre-step', { messages: claimed, turn: position.turn, step: position.step, signal, modelSelection: selection },
         (): Promise<PreStepDecision> => {
           const sections = renderContextSections(assembly)
           const context = this.runtimeContext.project(sections)
@@ -315,7 +759,7 @@ export class ReactLoopAgent implements Agent {
         toolSet.dispose()
         return decision
       }
-      return { ...decision, assembly, selection, toolSet }
+      return { ...decision, claimedGuarded: guarded.length > 0, assembly, selection, toolSet }
     } catch (error: unknown) {
       toolSet.dispose()
       throw error
@@ -334,27 +778,49 @@ export class ReactLoopAgent implements Agent {
     if (this.phase.kind !== 'running') {
       this.throwError(new Error(`agent "${this.id}": turn without driver reservation`))
     }
+    if (this.guardedClaimFault) throw new Error('guarded claim outcome is unknown')
     const phase = this.phase
     const { signal } = phase.abort
     signal.throwIfAborted()
+    const continuations = new Set<string>()
+    while (true) {
+      const proposed = this.proposedClaim('next-turn', 'initial', continuations)
+      const candidates = proposed.map(item => item.message.id)
+      if (this.admissions.isBlocked(candidates)) {
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- coordinator state can change between asynchronous waits.
+        if (this.guardedClaimCoordinator === undefined || this.guardedClaimFault) throw new Error('guarded claim coordinator is unavailable')
+        await this.admissions.waitForChange(signal)
+        continue
+      }
+      signal.throwIfAborted()
+      if (candidates.some(id => this.admissions.hasSeen(id))) {
+        await this.awaitGuardedCoordinator(signal)
+        if (!isDeepStrictEqual(proposed, this.proposedClaim('next-turn', 'initial', continuations))) continue
+      }
+      break
+    }
     const turn = phase.turn + 1
+    let turnStartSeq: number
     try {
-      this.session.append('turn/start', { turn })
+      turnStartSeq = this.session.append('turn/start', { turn }).seq
     } catch (error: unknown) {
       this.throwError(error)
     }
     phase.turn = turn
     let turnEnds: TurnEndReason | null = null
     let target: InboxTarget = 'next-turn'
+    let turnKind: TurnKind = 'initial'
+    const stoppingInputs: StoppingInputs = { turn, ids: new Set(), open: false }
     try {
       while (true) {
         signal.throwIfAborted()
         const step = phase.step + 1
-        const decision = await this.preStep(target, { turn, step })
+        const decision = await this.preStep(target, { turn, step, turnStartSeq }, turnKind, stoppingInputs.ids)
         if (decision.kind === 'reject') {
           turnEnds = { kind: 'blocked' }
           return false
         }
+        if (turnKind === 'initial') turnKind = decision.claimedGuarded ? 'guarded' : 'ordinary'
         try {
           if (turnEnds && decision.messages.length === 0) break
           // A removed waking message or an enter decision rewritten to empty
@@ -398,11 +864,12 @@ export class ReactLoopAgent implements Agent {
           decision.toolSet.dispose()
         }
         signal.throwIfAborted()
-        if (turnEnds && this.inbox.nextStep.length === 0) {
-          await this.dispatch.serial('agent/turn-stopping', { turn, signal })
+        if (turnEnds && this.proposedClaim('next-step', turnKind, stoppingInputs.ids).length === 0) {
+          stoppingInputs.open = true
+          try { await this.stoppingInputs.run(stoppingInputs, () => this.dispatch.serial('agent/turn-stopping', { turn, signal })) } finally { stoppingInputs.open = false }
           signal.throwIfAborted()
         }
-        if (turnEnds && this.inbox.nextStep.length === 0) break
+        if (turnEnds && this.proposedClaim('next-step', turnKind, stoppingInputs.ids).length === 0) break
         target = 'next-step'
       }
     } catch (error: unknown) {
