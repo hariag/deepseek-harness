@@ -473,6 +473,11 @@ class JsonlSessionPersistence extends SessionPersistence {
     return this.tracker.flushAll()
   }
 
+  /** Flush one Session's current live writer. */
+  override flushLiveSession(id: SessionId): Promise<void> {
+    return this.tracker.flushLiveSession(id)
+  }
+
   /**
    * Observe one stored session without reading its event log.
    * @param id - the stored session to observe.

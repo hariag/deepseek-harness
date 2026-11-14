@@ -3125,6 +3125,13 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         throws: ['{AggregateError} naming each session whose flush failed; the remaining handles still flush.'],
       },
       {
+        signature: 'flushLiveSession(_id: SessionId): Promise<void>',
+        description: 'Drain and flush the current live writer of one Session without appending an event. Callers reading a fixed prefix must capture the live Session identity and sequence first, and verify identity again after the barrier. This does not establish that external work or side effects completed.',
+        parameters: [{ name: '_id', description: 'the live Session whose writer must be flushed.' }],
+        returns: 'after the same live writer has durably flushed its accepted prefix.',
+        throws: ['when unsupported, or when the writer is missing, closes or changes.'],
+      },
+      {
         signature: 'abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined>',
         description: 'Observe one stored session without reading its event log or taking ownership.\n\nThe snapshot\'s `revision` is an opaque change token comparable only against revisions from the same service instance and session id: equal revisions may be treated as an unchanged log; unequal revisions promise nothing. Write-ownership churn does not change a revision. It exists for derived read-model caches keyed off `stat`/`list`; it plays no part in open, read, or resume.',
         parameters: [{ name: 'id', description: 'the stored session to observe.' }, { name: 'options', description: 'optional cancellation.' }],

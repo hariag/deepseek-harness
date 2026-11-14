@@ -27,6 +27,8 @@ kind: "package-reference"
 
 挂载一个持久化后端即可让会话持久化。后端把自己注册为 `ctx.sessionPersistence`，并把每个已发布会话的实时事件路由进该会话的活跃写句柄；agent-loop——会话在生产环境中的发布点——在发布之前获取每个会话的写句柄，因此组合中的其他部分不变。
 
+`flushLiveSession(sessionId)` 排空并刷新指定会话当前实时写入器，不追加事件；后端不支持或写入器缺失、关闭、更换时拒绝。读取固定持久前缀时，调用方须记录并重新核对实时 Session 的身份和序号；此屏障不能证明外部副作用是否发生。
+
 ### 选择后端
 
 seam 随产品交付 [JSONL](../session-persistence-jsonl/README.zh.md) 后端。它为每个会话存储一份仅追加的 `.jsonl.zstd` 日志。第三方后端可以直接实现该服务；必须遵守的[后端约定](#understand-the-implementation)见下文。

@@ -399,6 +399,17 @@ abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistence
 abstract flush(): Promise<void>
 
 /**
+ * Drain and flush the current live writer of one Session without appending an
+ * event. Callers reading a fixed prefix must capture the live Session identity
+ * and sequence first, and verify identity again after the barrier. This does
+ * not establish that external work or side effects completed.
+ * @param _id - the live Session whose writer must be flushed.
+ * @returns after the same live writer has durably flushed its accepted prefix.
+ * @throws when unsupported, or when the writer is missing, closes or changes.
+ */
+flushLiveSession(_id: SessionId): Promise<void>
+
+/**
  * Observe one stored session without reading its event log or taking
  * ownership.
  *

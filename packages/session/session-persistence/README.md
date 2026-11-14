@@ -27,6 +27,8 @@ This package lets applications persist and resume session event logs through a b
 
 Mount one persistence backend to make sessions durable. The backend registers itself as `ctx.sessionPersistence` and routes every published session's live events into that session's active write handle; agent-loop — the production publication point for sessions — acquires each session's write handle before publication, so nothing else in the composition changes.
 
+`flushLiveSession(sessionId)` drains and flushes that Session’s current live writer without adding an event, rejecting unsupported backends or missing, closed or replaced writers. To read a fixed durable prefix, callers must capture and recheck the live Session identity and sequence; this barrier does not establish that external side effects occurred.
+
 ### Choosing a backend
 
 The seam ships the [JSONL](../session-persistence-jsonl/README.md) backend: one append-only `.jsonl.zstd` log per session. A third-party backend may implement the service directly; the [backend contract](#understand-the-implementation) below is what it must honor.

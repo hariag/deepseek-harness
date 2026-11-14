@@ -360,6 +360,11 @@ export class JsonlSessionHandle implements SessionHandle {
     return next
   }
 
+  /** Reject if this handle has begun closing. */
+  assertLiveWriter(): void {
+    this.assertOpen('flush')
+  }
+
   /** Serialize one public mutating operation onto this handle's chain. */
   private async run(operation: string, op: () => Promise<void>): Promise<void> {
     this.assertOpen(operation)
@@ -520,6 +525,17 @@ export class JsonlBackendTracker {
       }
     }
     if (errors.length > 0) throw new AggregateError(errors, `${this.name} flush failed`)
+  }
+
+  /** Flush one live writer, refusing to confirm after ownership changes. */
+  async flushLiveSession(id: SessionId): Promise<void> {
+    const writer = this.writers.get(id)
+    if (writer === undefined || writer === null) throw new Error(`no live writer for session "${id}"`)
+    writer.assertLiveWriter()
+    await writer.drainLive()
+    await writer.flush()
+    if (this.writers.get(id) !== writer) throw new Error(`session "${id}" writer changed during flush`)
+    writer.assertLiveWriter()
   }
 
   /**
