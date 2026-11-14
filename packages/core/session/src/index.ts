@@ -554,7 +554,24 @@ function createAppendEvent(snapshot: ReturnType<typeof snapshotAppend>, seq: Ses
  */
 export class Session {
   private log: SessionEvent[] = []
+  private readonly appendGuards = new Set<(events: readonly SessionEvent[]) => void>()
   private batchPublication: SessionEvent | undefined
+
+  /**
+   * Install synchronous pre-commit validation for this Session's lifetime.
+   * The callback must inspect the full proposed batch without side effects.
+   * @param guard - validation invoked before any candidate enters the log.
+   * @returns an idempotent removal callback.
+   */
+  registerAppendGuard(guard: (events: readonly SessionEvent[]) => void): () => void {
+    this.appendGuards.add(guard)
+    return () => {
+      if (!this.appendGuards.has(guard)) return
+      const entry = attachments.get(this)
+      if (entry !== undefined && entry !== null) throw new Error('cannot remove a guard from an attached session')
+      this.appendGuards.delete(guard)
+    }
+  }
   /** Single incremental owner of surface acceptance and projection state. */
   private readonly surfaceManager: SurfaceManager
 
@@ -889,9 +906,10 @@ export class Session {
     const entry = this.publicationEntry()
     const startSeq = this.log.length
     const events = snapshots.map((snapshot, index) => createAppendEvent(snapshot, SessionSeq(startSeq + index)))
-    const acceptSurface = this.surfaceManager.prepareBatch(events)
     if (entry !== undefined) entry.appending = true
     try {
+      for (const guard of this.appendGuards) guard(events)
+      const acceptSurface = this.surfaceManager.prepareBatch(events)
       const publications = entry === undefined ? [] : events.map((event) => {
         const args: unknown[] = [this, event]
         const callbacks = collectSessionCallbacks(entry.emitCtx, [entry.carrier, 'session/event', ...args])
@@ -970,10 +988,10 @@ export class Session {
    * @param entry - the attachment read before the candidate was built.
    */
   private commit(event: SessionEvent, entry: SessionEntry | undefined): void {
-    this.surfaceManager.validateNext(event)
-
     if (entry !== undefined) entry.appending = true
     try {
+      for (const guard of this.appendGuards) guard([event])
+      this.surfaceManager.validateNext(event)
       const callbackArgs: unknown[] = [this, event]
       const callbacks = entry === undefined
         ? undefined

@@ -24,7 +24,7 @@ import type {
   InboxState,
 } from '@deepseek-ai/dsh-agent'
 import { modelSelectionProjectionDefinition } from '@deepseek-ai/dsh-agent'
-import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { errorChain, type ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { interruptedTurnClosers, SessionLogOffset, SessionPreparation } from '@deepseek-ai/dsh-session'
 import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -288,6 +288,10 @@ function validateConfiguredAgents(agents: Config['agents']): void {
 
 /** Concrete agent factory and driver service. */
 export class AgentLoop extends Service implements AgentFactory {
+  // oxlint-disable-next-line typescript/prefer-as-const -- Typert requires explicit public property types.
+  readonly durableAdmissionVersion: 1 = 1
+  // oxlint-disable-next-line typescript/prefer-as-const -- Typert requires explicit public property types.
+  readonly guardedProviderVersion: 1 = 1
   static inject = ['agents', 'sessions', 'llm', 'tools', 'systemPrompt', 'sessionProjections']
 
   /** Runtime schema for declarative agents. */
@@ -298,7 +302,7 @@ export class AgentLoop extends Service implements AgentFactory {
       sessionId: z.string().min(1),
       provider: z.string(),
       model: z.string(),
-      reasoningEffort: z.string().min(1) as z<ReturnType<typeof ReasoningEffortId>>,
+      reasoningEffort: z.string().min(1) as z<ReasoningEffortId>,
       maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
       cwd: z.string(),
       resumeSessionId: z.string(),
@@ -484,6 +488,7 @@ export class AgentLoop extends Service implements AgentFactory {
     let machine: ReactLoopAgent | undefined
     let detachSession: (() => void) | undefined
     let detachAgent: (() => void) | undefined
+    let releaseGuardedProvider: (() => void) | undefined
     let disposing: Promise<void> | undefined
     let publication: ReturnType<typeof Promise.withResolvers<void>> | undefined
     let ready = false
@@ -538,7 +543,9 @@ export class AgentLoop extends Service implements AgentFactory {
       }
       try {
         detachAgent?.()
+        releaseGuardedProvider?.()
         detachSession?.()
+        machine?.disposeAdmissionGuard()
       } finally {
         untrack()
       }
@@ -630,8 +637,11 @@ export class AgentLoop extends Service implements AgentFactory {
           assertLive()
           const setupCommit = await raceAbort(setup?.(agent.ctx, agent), abort.signal, id)
           assertLive()
+          const guardedCommit = await raceAbort(loopCtx.agents.prepareGuardedClaimProvider(agent, abort.signal), abort.signal, id)
+          assertLive()
           setupCommit?.commit()
           assertLive()
+          releaseGuardedProvider = guardedCommit()
           // The mounted backend routes announced live events into the active
           // write handle by session id; the loop only owns the handle itself.
           detachAgent = loopCtx.agents.enter(agent)
@@ -787,12 +797,26 @@ export class AgentLoop extends Service implements AgentFactory {
         try {
           // Taking write ownership FIRST excludes a concurrent resume of the
           // same id (in this process, a live agent's handle holds the claim).
-          handle = await raceAbortCall(
+          let snapshotValidated = false
+          const opened = await persistence.withWriteOpenValidation((validatedId, _header, events) => {
+            if (validatedId !== id) throw new Error('Agent resume attempted to open a different session for write')
+            // JSONL retains the validator for later append batches. The initial
+            // call has the complete leased history; subsequent batches are
+            // governed by the live Session's admission append guard instead.
+            if (snapshotValidated) return
+            this.runtime.ctx.agents.validateGuardedAdmissionHistory(events)
+            snapshotValidated = true
+          }, () => raceAbortCall(
             () => persistence.open(id, 'write', { signal: fused }),
             fused,
             id,
             (abandoned) => { void abandoned.close() },
-          )
+          ))
+          if (!opened.validated) {
+            await opened.value.close()
+            throw new Error('Agent resume did not validate a write handle')
+          }
+          handle = opened.value
           // Semantic crash repair is the agent layer's job: persistence hands
           // back the physically valid log; an interrupted final turn receives
           // synthetic closers (missing tool errors, step/end, turn/end) that
