@@ -441,13 +441,16 @@ export class ReactLoopAgent implements Agent {
     try {
       const first = await this.inspectGuardedAdmission(sessionId, expected, target, admissionId)
       if (first.observed === undefined || first.observed.admission === 'canceled') throw new Error('admission outcome is unknown')
-      if (!await this.loopCtx.sessions.flush(this.session)) throw new Error('admission has no durability listener')
+      const persistence = this.loopCtx.get('sessionPersistence')
+      if (persistence === undefined || this.loopCtx.sessions.get(this.session.id) !== this.session) throw new Error('admission session is unavailable')
+      const seq = this.session.seq
+      await persistence.flushLiveSession(this.session.id)
+      if (this.loopCtx.sessions.get(this.session.id) !== this.session || this.session.seq !== seq) throw new Error('admission session changed during flush')
       const checked = await this.inspectGuardedAdmission(sessionId, expected, target, admissionId)
-      if (checked.observed === undefined || checked.observed.admission === 'canceled' || this.admissions.isCanceled(expected.id)) {
+      if (this.loopCtx.sessions.get(this.session.id) !== this.session || this.session.seq !== seq
+        || checked.observed === undefined || checked.observed.admission === 'canceled' || this.admissions.isCanceled(expected.id)) {
         throw new Error('admission changed before reconciliation')
       }
-      const persistence = this.loopCtx.get('sessionPersistence')
-      if (persistence === undefined) throw new Error('admission persistence is unavailable')
       const eventType = checked.observed.admission === 'held' ? 'agent/admission/release' : 'agent/admission/reconciled'
       const receipt = persistence.beginLiveEventReceipt(this.session.id, eventType)
       try {
