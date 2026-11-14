@@ -527,7 +527,11 @@ export class JsonlBackendTracker {
     if (errors.length > 0) throw new AggregateError(errors, `${this.name} flush failed`)
   }
 
-  /** Flush one live writer, refusing to confirm after ownership changes. */
+  /**
+   * Flush one live writer, refusing confirmation after ownership changes.
+   * @param id - the Session whose writer must be flushed.
+   * @returns after the same open writer has flushed its routed prefix.
+   */
   async flushLiveSession(id: SessionId): Promise<void> {
     const writer = this.writers.get(id)
     if (writer === undefined || writer === null) throw new Error(`no live writer for session "${id}"`)
