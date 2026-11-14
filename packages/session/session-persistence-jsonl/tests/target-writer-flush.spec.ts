@@ -111,7 +111,7 @@ it('rejects a writer already closing without waiting for its blocked drain', asy
     const ready = new Promise<void>(resolve => { entered = resolve })
     const hold = new Promise<void>(resolve => { release = resolve })
     const drain = writer.drainLive.bind(writer)
-    vi.spyOn(writer, 'drainLive').mockImplementationOnce(async () => { entered(); await hold; await drain() })
+    vi.spyOn(writer, 'drainLive').mockImplementation(async () => { entered(); await hold; await drain() })
     const closing = writer.close()
     try {
       await ready
