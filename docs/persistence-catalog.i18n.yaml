@@ -9,8 +9,8 @@
   en: 1387c4505dde2faf
   zh: 48570fa1c13d6910
 /session-persistence-event-catalog/persistence-type-fingerprints:
-  en: 35ffb6107a5fbae2
-  zh: 06ce2128075e157b
+  en: deb16ac3be476fa0
+  zh: 8a8b04b5ac111e7b
 /session-persistence-event-catalog/event-envelope:
   en: 189352d7a3bba620
   zh: 5361f42035034672
@@ -18,11 +18,23 @@
   en: f4776ba3d0fd53ce
   zh: e86769f50a69055a
 /session-persistence-event-catalog/events/agent:
-  en: 9188862058c6986b
-  zh: 9188862058c6986b
+  en: 87354bb01c4b8dfe
+  zh: 87354bb01c4b8dfe
+/session-persistence-event-catalog/events/agent/agent-admission-cancel-log-only:
+  en: 7c335128a08e2ba4
+  zh: b1a55420b2d13c37
+/session-persistence-event-catalog/events/agent/agent-admission-hold-log-only:
+  en: 60f6bb83703be5b0
+  zh: 57a566dbc2ed123d
+/session-persistence-event-catalog/events/agent/agent-admission-reconciled-log-only:
+  en: 96cdf50de0032431
+  zh: e012b8f72466508f
+/session-persistence-event-catalog/events/agent/agent-admission-release-log-only:
+  en: b360ac9343d2198a
+  zh: c80370d4a38a69aa
 /session-persistence-event-catalog/events/agent/agent-inbox-spliced-log-only:
-  en: 481727894895b43b
-  zh: 098bc9788bf88968
+  en: 1f69817726f39eb6
+  zh: 4eb4eee5fc2f2e8a
 /session-persistence-event-catalog/events/agent-preset:
   en: 49891ca9be5ac123
   zh: 49891ca9be5ac123
@@ -141,8 +153,8 @@
   en: 9edf4ef31e60e880
   zh: 9edf4ef31e60e880
 /session-persistence-event-catalog/events/model/model-selection-log-only:
-  en: c2a60ec7d297ed79
-  zh: a2f6b2d3c733ce96
+  en: ab829e211d67d04b
+  zh: 96f4d347ad9a52b7
 /session-persistence-event-catalog/events/permission:
   en: 19917bc5438e60af
   zh: 19917bc5438e60af
@@ -330,8 +342,20 @@
   en: 81e342aa8769e5a9
   zh: 81e342aa8769e5a9
 /session-persistence-event-catalog/resolved-persistence-types/agent-preset-selected:
-  en: b3b528acadd04168
-  zh: b3b528acadd04168
+  en: f63aa017e025702f
+  zh: f63aa017e025702f
+/session-persistence-event-catalog/resolved-persistence-types/agent-admission-cancel:
+  en: 332c46cf3abac98b
+  zh: 332c46cf3abac98b
+/session-persistence-event-catalog/resolved-persistence-types/agent-admission-hold:
+  en: b544ba3807b5cc44
+  zh: b544ba3807b5cc44
+/session-persistence-event-catalog/resolved-persistence-types/agent-admission-reconciled:
+  en: 1fdbd90faddd5771
+  zh: 1fdbd90faddd5771
+/session-persistence-event-catalog/resolved-persistence-types/agent-admission-release:
+  en: c72943617d9628ea
+  zh: c72943617d9628ea
 /session-persistence-event-catalog/resolved-persistence-types/agent-inbox-spliced:
   en: 8f6d91375141d923
   zh: 8f6d91375141d923
@@ -1425,8 +1449,11 @@
   en: a74e3dfa51c987af
   zh: 6c3c87974d7a7260
 /session-persistence-event-catalog/resolved-persistence-types/active~2:
-  en: c861888d6239b700
-  zh: a9b2271d3c6b8737
+  en: 38fc8f1726a967f8
+  zh: 8686625349e31fc4
+/session-persistence-event-catalog/resolved-persistence-types/admissionid-messageid:
+  en: d389020dd9f9dff6
+  zh: 5e60a4bb097e7822
 /session-persistence-event-catalog/resolved-persistence-types/agentpreset:
   en: 1282a0b3d5fa8d4d
   zh: aa533aea643dbefb
@@ -1563,8 +1590,8 @@
   en: 55a056f4b970329f
   zh: 6763a01bb6abe753
 /session-persistence-event-catalog/resolved-persistence-types/inserted-outcome-removedcount-start:
-  en: d2b118f32769b0d9
-  zh: edea493977131d2b
+  en: 36d0b42f72366256
+  zh: d70cd3cdff7263ed
 /session-persistence-event-catalog/resolved-persistence-types/interrupted-message-step-stream:
   en: 8e86cd838e3e4a49
   zh: f5fec2a8adf1f3cc
@@ -1986,8 +2013,20 @@
   en: 374b8adee8d571fa
   zh: b21057efc58e6490
 /session-persistence-event-catalog/resolved-persistence-types/type-agent-preset-selected:
-  en: b85970209e42ae80
-  zh: 83041799d5da5d74
+  en: 9314c9f4daa3024a
+  zh: 3682bf68ace90618
+/session-persistence-event-catalog/resolved-persistence-types/type-agent-admission-cancel:
+  en: da3b7714cd3cd00e
+  zh: e4d505798600f7fe
+/session-persistence-event-catalog/resolved-persistence-types/type-agent-admission-hold:
+  en: 69bf09d4192e330c
+  zh: 8c7ab409dc30c36d
+/session-persistence-event-catalog/resolved-persistence-types/type-agent-admission-reconciled:
+  en: 31b36511dee8e2a3
+  zh: 7d2c46faa043214d
+/session-persistence-event-catalog/resolved-persistence-types/type-agent-admission-release:
+  en: 341ddfccc3c48d07
+  zh: 3fa7e06a5ee6e6c2
 /session-persistence-event-catalog/resolved-persistence-types/type-agent-inbox-spliced:
   en: 1c6e8cf2fa5408c4
   zh: 14d24d858024e8cf

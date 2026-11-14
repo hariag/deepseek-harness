@@ -1026,6 +1026,10 @@ export const FOUNDATION_TYPE_NAMES: ReadonlySet<string> = new Set([
 
 /** Project types deliberately documented outside the subsystems catalog. */
 export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
+  GuardedAdmissionProjection: 'guarded admission index is defined by packages/core/agent/src/admission-projection.ts',
+  GuardedAdmissionRecord: 'guarded admission record is defined by packages/core/agent/src/admission-projection.ts',
+  GuardedClaimProvider: 'trusted coordinator provider is defined by packages/core/agent/src/index.ts',
+  SessionWriteOpenValidationResult: 'scoped write-open result is defined by packages/session/session-persistence/src/index.ts',
   ActionCardDecision: 'packages/experimental/action-cards/README.md',
   ActionCardKind: 'packages/experimental/action-cards/README.md',
   ActionCardResult: 'packages/experimental/action-cards/README.md',

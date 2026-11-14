@@ -194,13 +194,13 @@ export interface GuardedClaimInput {
   readonly target: InboxTarget
 }
 
+/** Exact turn boundary selected by the Agent for a guarded claim. */
+export interface GuardedClaimTurn { readonly turn: number; readonly turnStartSeq: number }
 /**
  * Trusted synchronous task authority. It must validate the entire batch and
  * commit its fenced transaction before returning `committed`. It calls `claim`
  * exactly once inside that transaction. Failure after claim is outcome-unknown.
  */
-/** Exact turn boundary selected by the Agent for a guarded claim. */
-export interface GuardedClaimTurn { readonly turn: number; readonly turnStartSeq: number }
 export type GuardedClaimCoordinator = (
   sessionId: string,
   inputs: readonly GuardedClaimInput[],

@@ -102,6 +102,12 @@ interface ProjectionDefinition<K extends string, S> {
    * equivalence before retaining a version; schema acceptance alone is insufficient.
    */
   stateVersion: number
+  /**
+   * Exclude this host-only unit from disposable checkpoints and cold restores.
+   * Its first live read folds the Session log; later reads advance that cell.
+   * Use for state whose correctness controls security or task admission.
+   */
+  replayOnHydrate?: true
 }
 ```
 
@@ -400,7 +406,7 @@ snapshot( session: Session, keys?: ProjectionKeySelection, ): ProjectionSnapshot
 summaryKeys(): ReadonlySet<Extract<keyof SessionProjectionMap, string>>
 
 /**
- * State-level checkpoint of every persisted unit for one session, read
+ * State-level checkpoint of every cacheable unit for one session, read
  * from the watermark cache (missing cells fold lazily over the in-memory
  * log). This is the write side of the persisted projection cache: the
  * returned rows are the `(key → {ver, seq, val})` part of the durable
@@ -416,7 +422,7 @@ summaryKeys(): ReadonlySet<Extract<keyof SessionProjectionMap, string>>
  * latest state; a Session that has no cell of it gets no row. {@link restore}
  * folds only live units, so its refreshed rows omit released units.
  * @param session - the session whose unit states are checkpointed.
- * @returns one row per registered key, plus one per released key with a cell for this Session.
+ * @returns one row per cacheable registered key, plus one per released key with a cell for this Session.
  */
 checkpoint(session: Session): ProjectionCheckpoint
 

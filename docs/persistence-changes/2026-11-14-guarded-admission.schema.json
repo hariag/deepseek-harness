@@ -1,0 +1,24 @@
+{
+  "formatVersion": 2,
+  "roots": [
+    {"key":"event:agent/admission/cancel","kind":"event","event":"agent/admission/cancel","surface":false,"digest":"beddf08f4c251fe00bd33763b31d2db7eea3fff7fdc3ff59a72fa293f11cb187"},
+    {"key":"event:agent/admission/hold","kind":"event","event":"agent/admission/hold","surface":false,"digest":"6c28dac83cdfa5cfdb14fa218ca362312c8bc883cc6b70ac161c01f8d2590a80"},
+    {"key":"event:agent/admission/reconciled","kind":"event","event":"agent/admission/reconciled","surface":false,"digest":"6c447256e6ed7acef60b37695d7dbb80d77ee068354d8eb6f97bec6faab22dc3"},
+    {"key":"event:agent/admission/release","kind":"event","event":"agent/admission/release","surface":false,"digest":"ab7095e8f3e6ada5c995179895eebb2033575a80990dd1880a1e7d793eb51a23"}
+  ],
+  "types": [],
+  "nodes": {
+    "0657d3ca5ac4e7bf": {"kind":"primitive","type":"number"},
+    "2d6c153a859841d7": {"kind":"literal","value":"agent/admission/reconciled"},
+    "4cd48f3e5108bd6e": {"kind":"primitive","type":"string"},
+    "57e4951a35e06084": {"kind":"literal","value":"agent/admission/cancel"},
+    "6c28dac83cdfa5cf": {"kind":"object","properties":[{"name":"data","type":"7cbf9d84e8dec78a","optional":false},{"name":"ignorable","type":"dacf3d5f3e4ff619","optional":true},{"name":"seq","type":"0657d3ca5ac4e7bf","optional":false},{"name":"time","type":"0657d3ca5ac4e7bf","optional":false},{"name":"type","type":"a7fd2ceb20f56674","optional":false}],"indices":[]},
+    "6c447256e6ed7ace": {"kind":"object","properties":[{"name":"data","type":"7cbf9d84e8dec78a","optional":false},{"name":"ignorable","type":"dacf3d5f3e4ff619","optional":true},{"name":"seq","type":"0657d3ca5ac4e7bf","optional":false},{"name":"time","type":"0657d3ca5ac4e7bf","optional":false},{"name":"type","type":"2d6c153a859841d7","optional":false}],"indices":[]},
+    "7cbf9d84e8dec78a": {"kind":"object","properties":[{"name":"admissionId","type":"4cd48f3e5108bd6e","optional":false},{"name":"messageId","type":"4cd48f3e5108bd6e","optional":false}],"indices":[]},
+    "8c4170607acbb274": {"kind":"literal","value":"agent/admission/release"},
+    "a7fd2ceb20f56674": {"kind":"literal","value":"agent/admission/hold"},
+    "ab7095e8f3e6ada5": {"kind":"object","properties":[{"name":"data","type":"7cbf9d84e8dec78a","optional":false},{"name":"ignorable","type":"dacf3d5f3e4ff619","optional":true},{"name":"seq","type":"0657d3ca5ac4e7bf","optional":false},{"name":"time","type":"0657d3ca5ac4e7bf","optional":false},{"name":"type","type":"8c4170607acbb274","optional":false}],"indices":[]},
+    "beddf08f4c251fe0": {"kind":"object","properties":[{"name":"data","type":"7cbf9d84e8dec78a","optional":false},{"name":"ignorable","type":"dacf3d5f3e4ff619","optional":true},{"name":"seq","type":"0657d3ca5ac4e7bf","optional":false},{"name":"time","type":"0657d3ca5ac4e7bf","optional":false},{"name":"type","type":"57e4951a35e06084","optional":false}],"indices":[]},
+    "dacf3d5f3e4ff619": {"kind":"literal","value":true}
+  }
+}

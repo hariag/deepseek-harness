@@ -412,6 +412,14 @@ abstract flush(): Promise<void>
 flushLiveSession(_id: SessionId): Promise<void>
 
 /**
+ * Validate every write open after acquiring its lease and before repair.
+ * @param _validate - checks the exclusively leased event snapshot.
+ * @param _operation - the operation that opens the writer.
+ * @returns the operation result and whether a writer was validated.
+ */
+withWriteOpenValidation<T>( _validate: (id: SessionId, header: SessionHeader, events: readonly SessionEvent[]) => void | Promise<void>, _operation: () => Promise<T>, ): Promise<SessionWriteOpenValidationResult<T>>
+
+/**
  * Observe an event type on the session's current live writer. Unsupported
  * backends reject; confirmation is evidence of persistence, not business
  * completion. Dispose the receipt when the observation is no longer needed.
@@ -445,7 +453,7 @@ abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<S
 abstract list(options?: SessionPersistenceListOptions): Promise<readonly SessionPersistenceSnapshot[]>
 ```
 
-Types: [SessionId](core.zh.md)
+Types: [SessionEvent](session.zh.md) · [SessionId](core.zh.md)
 
 Source: [`packages/session/session-persistence/src/index.ts`](../../packages/session/session-persistence/src/index.ts)
 <!-- END GENERATED cordis-surface -->
