@@ -229,6 +229,16 @@ it('keeps an actual recovered guarded input parked until provider binding and ex
   expect(restored.agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === ordinary.id)).toBe(true)
   expect(restored.agent.inbox.nextTurn.some(message => message.id === input.id)).toBe(true)
   if (restored.agent.reconcileGuardedAdmission === undefined) throw new Error('reconciliation unavailable')
+  const flush = ctx.sessionPersistence.flushLiveSession.bind(ctx.sessionPersistence)
+  vi.spyOn(ctx.sessionPersistence, 'flushLiveSession').mockImplementationOnce(async (sessionId) => {
+    await flush(sessionId)
+    restored.agent.session.append('agent/inbox/spliced', {
+      target: 'next-turn', start: restored.agent.inbox.nextTurn.length, removedCount: 0, inserted: [],
+    })
+  })
+  await expect(restored.agent.reconcileGuardedAdmission(id, input, 'next-turn', 'recovery-1')).rejects.toThrow('session changed during flush')
+  expect(restored.agent.inbox.nextTurn.some(message => message.id === input.id)).toBe(true)
+  expect(adapter.requests).toHaveLength(1)
   await restored.agent.reconcileGuardedAdmission(id, input, 'next-turn', 'recovery-1')
   await restored.agent.whenIdle()
   expect(adapter.requests).toHaveLength(2)
