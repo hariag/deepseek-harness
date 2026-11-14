@@ -58,6 +58,72 @@ it('binds each guarded claim to its actual turn-start event without changing the
   await handle.dispose()
 })
 
+it('keeps later normal steer and queued work out of a guarded turn and runs both afterwards', async () => {
+  const { ctx } = await setup()
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => coordinator)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-redo-isolation'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded admission unavailable')
+  const target = createUserMessage({ content:[{ type:'text', text:'specific interrupted work' }], source:{ kind:'user' } })
+  const steer = createUserMessage({ content:[{ type:'text', text:'later steering input' }], source:{ kind:'user' } })
+  const queued = createUserMessage({ content:[{ type:'text', text:'later queued input' }], source:{ kind:'user' } })
+  let injected = false
+  ctx.on('agent/pre-step', async (_payload, next) => {
+    const decision = await next()
+    if (decision.kind === 'enter' && !injected && decision.messages.some(message => message.id === target.id)) {
+      injected = true
+      agent.steer(steer)
+      agent.followup(queued)
+    }
+    return decision
+  })
+  await agent.guardedSend(target,'next-turn','redo-isolation')
+  await agent.whenIdle()
+  expect(injected).toBe(true)
+  const byTurn = new Map<number,string[]>()
+  let turn = -1
+  for (const event of agent.session.snapshotEvents()) {
+    if (event.type === 'turn/start') turn = event.data.turn
+    if (event.type === 'user/message' && [target.id,steer.id,queued.id].includes(event.data.id)) {
+      byTurn.set(turn,[...(byTurn.get(turn)??[]),event.data.id])
+    }
+  }
+  const batches=[...byTurn.values()]
+  expect(batches).toEqual([[target.id],[steer.id,queued.id]])
+  expect(agent.inbox.nextStep).toHaveLength(0)
+  expect(agent.inbox.nextTurn).toHaveLength(0)
+  dispose()
+  await handle.dispose()
+})
+
+it('keeps a guarded input and later normal work in their inbox when authority refuses before claim', async () => {
+  const { ctx } = await setup()
+  let calls = 0
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => () => { calls += 1; throw new Error('authority refused') })
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-refusal-keeps-queue'), agentOptions: options })
+  const { agent } = handle
+  if (agent.guardedSend === undefined) throw new Error('guarded admission unavailable')
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const maintenance = agent.runMaintenance(async () => { await gate })
+  const target = createUserMessage({ content:[{ type:'text',text:'specific interrupted work' }],source:{kind:'user'} })
+  const queued = createUserMessage({ content:[{ type:'text',text:'later normal work' }],source:{kind:'user'} })
+  try {
+    await agent.guardedSend(target,'next-turn','redo-refused')
+    agent.followup(queued)
+    release()
+    await maintenance
+    await agent.whenIdle()
+    expect(calls).toBeGreaterThan(0)
+    expect(agent.inbox.nextTurn.map(message=>message.id)).toEqual([target.id,queued.id])
+    expect(agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === target.id)).toBe(false)
+  } finally {
+    release()
+    dispose()
+    await handle.dispose()
+  }
+})
+
 it('rejects malformed admission history before writing interrupted-turn repair to JSONL', async () => {
   const { ctx, adapter } = await setup()
   const id = SessionId('malformed-admission-before-repair')
