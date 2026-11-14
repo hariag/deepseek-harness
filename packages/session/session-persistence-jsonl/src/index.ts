@@ -25,7 +25,7 @@ import {
   SessionPersistenceCorruptionError,
   SessionAlreadyExistsError, SessionPersistenceNotFoundError,
   assertStoredId, materializeCreateHeader, sessionFormatVersionRefusal, validateStoredEvents,
-  type SessionAccess, type SessionHandle,
+  type SessionAccess, type SessionHandle, type SessionLiveEventReceipt,
   type SessionHandleReadResult,
   type SessionLocation, type SessionPersistenceCreateOptions,
   type SessionPersistenceListOptions, type SessionPersistenceOpenOptions,
@@ -471,6 +471,11 @@ class JsonlSessionPersistence extends SessionPersistence {
    */
   flush(): Promise<void> {
     return this.tracker.flushAll()
+  }
+
+  /** Start an observation against the session's current writer. */
+  override beginLiveEventReceipt(id: SessionId, type: string): SessionLiveEventReceipt {
+    return this.tracker.beginLiveEventReceipt(id, type)
   }
 
   /**

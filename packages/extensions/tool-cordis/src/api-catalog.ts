@@ -3125,6 +3125,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         throws: ['{AggregateError} naming each session whose flush failed; the remaining handles still flush.'],
       },
       {
+        signature: 'beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt',
+        description: 'Observe an event type on the session\'s current live writer. Unsupported backends reject; confirmation is evidence of persistence, not business completion. Dispose the receipt when the observation is no longer needed.',
+        parameters: [{ name: '_id', description: 'the live session\'s id.' }, { name: '_type', description: 'event type to observe.' }],
+        returns: 'a bounded writer-specific confirmation handle.',
+      },
+      {
         signature: 'abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined>',
         description: 'Observe one stored session without reading its event log or taking ownership.\n\nThe snapshot\'s `revision` is an opaque change token comparable only against revisions from the same service instance and session id: equal revisions may be treated as an unchanged log; unequal revisions promise nothing. Write-ownership churn does not change a revision. It exists for derived read-model caches keyed off `stat`/`list`; it plays no part in open, read, or resume.',
         parameters: [{ name: 'id', description: 'the stored session to observe.' }, { name: 'options', description: 'optional cancellation.' }],
@@ -9020,6 +9026,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionListValue',
     declaration: 'export interface SessionListValue {\n    readonly items: readonly SessionSummary[];\n}',
+  },
+  {
+    name: 'SessionLiveEventReceipt',
+    declaration: 'export interface SessionLiveEventReceipt {\n    confirm(event: SessionEvent): Promise<void>;\n    dispose(): void;\n}',
   },
   {
     name: 'SessionLocation',

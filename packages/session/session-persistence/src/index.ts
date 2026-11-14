@@ -44,6 +44,18 @@ export {
   validateStoredEvents,
 } from './storage-contract.ts'
 
+/** A bounded observation used to confirm one exact event on its live writer. */
+export interface SessionLiveEventReceipt {
+  /**
+   * Confirm that this exact observed event reached durable storage.
+   * @param event - an event observed after this receipt was opened.
+   * @returns when the event is durably stored by the same writer.
+   */
+  confirm(event: SessionEvent): Promise<void>
+  /** Release the observation; subsequent confirmation fails. */
+  dispose(): void
+}
+
 /**
  * Lightweight stored-session observation returned by {@link SessionPersistence.stat}
  * and {@link SessionPersistence.list} without reading the full event log.
@@ -185,6 +197,18 @@ export abstract class SessionPersistence extends Service {
    *   remaining handles still flush.
    */
   abstract flush(): Promise<void>
+
+  /**
+   * Observe an event type on the session's current live writer. Unsupported
+   * backends reject; confirmation is evidence of persistence, not business
+   * completion. Dispose the receipt when the observation is no longer needed.
+   * @param _id - the live session's id.
+   * @param _type - event type to observe.
+   * @returns a bounded writer-specific confirmation handle.
+   */
+  beginLiveEventReceipt(_id: SessionId, _type: string): SessionLiveEventReceipt {
+    throw new Error('Live event receipts are unsupported by this persistence backend')
+  }
 
   /**
    * Observe one stored session without reading its event log or taking
