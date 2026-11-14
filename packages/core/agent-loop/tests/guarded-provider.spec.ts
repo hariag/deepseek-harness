@@ -1064,3 +1064,71 @@ it('binds configured startup Agents before their created notification', async ()
   expect(() => agent.setGuardedClaimCoordinator?.(coordinator)).toThrow('already installed')
   dispose()
 })
+
+it('checks the final frozen request before a guarded model call', async () => {
+  const { ctx, adapter } = await setup()
+  const seen: unknown[] = []
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeModelRequest: (_session: Session, request: unknown) => { seen.push(request); return true } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-request-authorized'), agentOptions: options })
+  const { agent } = handle
+  expect(agent.guardedRequestBoundaryVersion).toBe(1)
+  if (!agent.guardedSend) throw new Error('guarded send unavailable')
+  await agent.guardedSend(createUserMessage({ content:[{ type:'text', text:'authorized' }], source:{ kind:'user' } }), 'next-turn', 'authorized-request')
+  await agent.whenIdle()
+  expect(seen).toHaveLength(1)
+  expect(Object.isFrozen(seen[0])).toBe(true)
+  expect(adapter.requests).toHaveLength(1)
+  expect(adapter.requests[0]).toBe(seen[0])
+  dispose()
+  await handle.dispose()
+})
+
+it('does not start the model when a guarded final request is refused', async () => {
+  const { ctx, adapter } = await setup()
+  const checked = Promise.withResolvers<void>()
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeModelRequest: () => { checked.resolve(); return false } },
+  )
+  const dispose = await ctx.agents.registerGuardedClaimProvider(() => authority)
+  const handle = await ctx.agents.create({ sessionId: SessionId('guarded-request-denied'), agentOptions: options })
+  const { agent } = handle
+  if (!agent.guardedSend) throw new Error('guarded send unavailable')
+  await agent.guardedSend(createUserMessage({ content:[{ type:'text', text:'denied' }], source:{ kind:'user' } }), 'next-turn', 'denied-request')
+  await checked.promise
+  await agent.whenIdle()
+  expect(adapter.requests).toHaveLength(0)
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/end' && event.data.reason.kind === 'error')).toBe(true)
+  dispose()
+  await handle.dispose()
+})
+
+it.each(['async', 'append', 'authority-change'] as const)('fails closed on guarded model guard %s', async mode => {
+  const { ctx, adapter } = await setup()
+  const checked = Promise.withResolvers<void>()
+  let release = () => {}
+  const authority: GuardedClaimCoordinator = Object.assign(
+    (_session: string, _inputs: readonly unknown[], claim: () => void) => { claim(); return 'committed' as const },
+    { beforeModelRequest: (session: Session) => {
+      checked.resolve()
+      if (mode === 'async') return Promise.resolve(true) as unknown as boolean
+      if (mode === 'append') session.append('turn/start', { turn:999 })
+      if (mode === 'authority-change') release()
+      return true
+    } },
+  )
+  const handle = await ctx.agents.create({ sessionId: SessionId(`guarded-model-${mode}`), agentOptions: options })
+  const { agent } = handle
+  if (!agent.guardedSend || !agent.setGuardedClaimCoordinator) throw new Error('guarded send unavailable')
+  release = agent.setGuardedClaimCoordinator(authority)
+  await agent.guardedSend(createUserMessage({ content:[{ type:'text', text:'restricted' }], source:{ kind:'user' } }), 'next-turn', `restricted-${mode}`)
+  await checked.promise
+  await agent.whenIdle()
+  expect(adapter.requests).toHaveLength(0)
+  expect(agent.session.snapshotEvents().some(event => event.type === 'turn/end' && event.data.reason.kind === 'error')).toBe(true)
+  await handle.dispose()
+})

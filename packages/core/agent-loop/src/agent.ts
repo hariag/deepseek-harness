@@ -122,6 +122,7 @@ function abortedCancelCause(signal: AbortSignal): AgentCancelCause | undefined {
 export class ReactLoopAgent implements Agent {
   readonly durableAdmissionVersion = 1 as const
   readonly guardedClaimTurnVersion = 1 as const
+  readonly guardedRequestBoundaryVersion = 1 as const
   readonly model: AgentModel
   readonly inbox: ReactLoopInbox
   private readonly admissions: AdmissionState
@@ -129,6 +130,7 @@ export class ReactLoopAgent implements Agent {
   private guardedStartCallbacks: { before: NonNullable<GuardedClaimCoordinator['beforeTurnStart']>, cancel: NonNullable<GuardedClaimCoordinator['cancelTurnStart']> } | undefined
   private guardedCoordinatorReady: Promise<void> | undefined
   private guardedCoordinatorToken: object | undefined
+  private guardedRequestGuard: GuardedClaimCoordinator['beforeModelRequest'] | undefined
   private guardedClaimFault = false
   private allowedGuardedClaims: ReadonlySet<string> | undefined
   private allowedGuardedDiscard: string | undefined
@@ -287,10 +289,13 @@ export class ReactLoopAgent implements Agent {
       throw new Error('guarded claim coordinator is unavailable or already installed')
     }
     const before = coordinator.beforeTurnStart, cancel = coordinator.cancelTurnStart
+    const requestGuard = coordinator.beforeModelRequest
+    if (requestGuard !== undefined && typeof requestGuard !== 'function') throw new Error('invalid guarded request guard')
     if ((before === undefined) !== (cancel === undefined) || (before !== undefined && typeof before !== 'function') || (cancel !== undefined && typeof cancel !== 'function')) {
       throw new Error('guarded start callbacks must be installed together')
     }
     this.guardedClaimCoordinator = coordinator
+    this.guardedRequestGuard = requestGuard
     this.guardedStartCallbacks = before !== undefined && cancel !== undefined ? { before, cancel } : undefined
     this.guardedCoordinatorReady = ready
     const token = {}
@@ -300,6 +305,7 @@ export class ReactLoopAgent implements Agent {
     } catch (error: unknown) {
       if (this.guardedCoordinatorToken === token) {
         this.guardedClaimCoordinator = undefined
+        this.guardedRequestGuard = undefined
         this.guardedStartCallbacks = undefined
         this.guardedCoordinatorReady = undefined
         this.guardedCoordinatorToken = undefined
@@ -313,6 +319,7 @@ export class ReactLoopAgent implements Agent {
       installed = false
       if (this.guardedCoordinatorToken === token) {
         this.guardedClaimCoordinator = undefined
+        this.guardedRequestGuard = undefined
         this.guardedStartCallbacks = undefined
         this.guardedCoordinatorReady = undefined
         this.guardedCoordinatorToken = undefined
@@ -925,7 +932,7 @@ export class ReactLoopAgent implements Agent {
           try {
             // max-tokens is sticky: once any step hits the ceiling, later steps
             // that complete normally must not downgrade the turn outcome.
-            const stepEnd = await this.step(decision)
+            const stepEnd = await this.step(decision, turnKind, initialCoordinatorToken)
             // max-tokens stays sticky: a later completed step must not
             // downgrade the turn outcome.
             if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
@@ -991,7 +998,7 @@ export class ReactLoopAgent implements Agent {
     return true
   }
 
-  private async step(decision: Extract<PreparedStep, { kind: 'enter' }>): Promise<StepEndReason | null> {
+  private async step(decision: Extract<PreparedStep, { kind: 'enter' }>, turnKind: TurnKind, coordinatorToken: object | undefined): Promise<StepEndReason | null> {
     /* v8 ignore next -- private callers establish the running phase before executing a step */
     if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": step outside running phase`)
     const { turn, step, abort: { signal } } = this.phase
@@ -1036,6 +1043,24 @@ export class ReactLoopAgent implements Agent {
       }
       firstAttempt = false
       const request = this.buildRequest(config, preparedCall, assembly.tools, { turn, step }, startsRequestSeries, signal)
+      if (turnKind === 'guarded') {
+        const coordinator = this.guardedClaimCoordinator, guard = this.guardedRequestGuard
+        if (coordinator === undefined || coordinatorToken === undefined || this.guardedCoordinatorToken !== coordinatorToken || this.guardedClaimFault) {
+          throw new Error('guarded request authority is unavailable')
+        }
+        if (guard !== undefined) {
+          const seq = this.session.seq
+          let accepted: unknown
+          this.#guardedStartCallbackActive = true
+          try { accepted = guard.call(coordinator, this.session, request, Object.freeze({ turn, step })) }
+          finally { this.#guardedStartCallbackActive = false }
+          if (accepted !== true || this.guardedClaimCoordinator !== coordinator || this.guardedRequestGuard !== guard
+            || this.guardedCoordinatorToken !== coordinatorToken || this.guardedClaimFault || this.session.seq !== seq || signal.aborted) {
+            if (accepted instanceof Promise) void accepted.catch(() => {})
+            throw new Error('guarded model request was not authorized')
+          }
+        }
+      }
       const live = new AssistantStreamAttempt(
         this.session.id,
         ++this.assistantAttemptCounter,

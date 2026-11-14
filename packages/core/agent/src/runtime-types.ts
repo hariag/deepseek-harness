@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type {
-  LlmAttemptId, LlmCallConfig, LlmFailure, MessageId, ReasoningEffortId, ResolvedRetryPolicy, StreamChunk,
+  GenerateOptions, LlmAttemptId, LlmCallConfig, LlmFailure, MessageId, ReasoningEffortId, ResolvedRetryPolicy, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { AgentCancelCause, Session, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
 export type { AgentCancelCause } from '@deepseek-ai/dsh-session'
@@ -215,6 +215,15 @@ export type GuardedClaimCoordinator = ((
    */
   beforeTurnStart?: (session: Session, input: Readonly<GuardedClaimInput>, turn: Readonly<GuardedClaimTurn>) => void
   /**
+   * Optional synchronous final request guard for guarded turns, called after
+   * request construction and before each model attempt. Return true only for
+   * the exact authorized, frozen request. This does not authorize tool effects.
+   * @param session - exact target Session instance.
+   * @param request - frozen final model request including messages and tools.
+   * @param position - current turn and step.
+   */
+  beforeModelRequest?: (session: Session, request: Readonly<GenerateOptions>, position: Readonly<{ turn: number, step: number }>) => boolean
+  /**
    * Synchronously remove or mark unknown the exact provisional route if its turn-start cannot be appended; do not append Session events.
    * @param session - exact target Session instance, not just its id.
    * @param input - frozen guarded input and admission identity.
@@ -241,6 +250,8 @@ declare module './types.ts' {
     readonly durableAdmissionVersion?: 1
     /** Capability declaration: guarded claims include their actual turn identity. */
     readonly guardedClaimTurnVersion?: 1
+    /** Capability declaration: guarded model attempts can be checked at the final frozen request boundary. */
+    readonly guardedRequestBoundaryVersion?: 1
 
     /**
    * Clear queued and steering work — unless `keepInbox` — and abort the active
