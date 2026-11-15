@@ -1,7 +1,8 @@
 /** Real GIO discovery and desktop-entry launch in private XDG data/config roots. */
 import { execFile, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { promisify } from 'node:util'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, onTestFinished, vi } from 'vitest'
@@ -31,6 +32,10 @@ it.skipIf(!gioAvailable)('queries and launches an installed Linux desktop entry 
   await mkdir(join(data, 'applications'), { recursive: true })
   await mkdir(config)
   await mkdir(empty)
+  const systemDataDirs = (process.env.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean)
+  const mimeDirectory = systemDataDirs.map(dir => join(dir, 'mime')).find(dir => existsSync(join(dir, 'mime.cache')))
+  if (mimeDirectory === undefined) throw new Error('GIO test requires a system MIME database')
+  await symlink(mimeDirectory, join(empty, 'mime'))
   const path = join(root, "测试 ' file.txt")
   const script = join(root, 'handler.cjs')
   const marker = join(root, 'opened.json')
