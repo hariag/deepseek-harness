@@ -30,6 +30,7 @@ export type * from './types.ts'
 export const name = 'commands'
 
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u
+const COMMAND_CHANGE_INTERVAL_MS = 250
 
 /** Shared frozen attachments value for attachment-free invocations. */
 const NO_ATTACHMENTS: readonly (ImageBlock | FileBlock)[] = Object.freeze([])
@@ -266,6 +267,9 @@ export class CommandRuntime extends TypertRemoteService {
     () => { this.notifyChange() },
   )
 
+  private changeTimer: ReturnType<typeof setTimeout> | undefined
+  private changePending = false
+
   /** Monotonic per-instance counter behind {@link mintCommandId}. */
   private commandSeq = 0
   /** Instance token keeping minted ids unique across process restarts over one resumed log. */
@@ -275,6 +279,11 @@ export class CommandRuntime extends TypertRemoteService {
 
   constructor(ctx: Context) {
     super(ctx, 'commands')
+    ctx.effect(() => () => {
+      if (this.changeTimer !== undefined) clearTimeout(this.changeTimer)
+      this.changeTimer = undefined
+      this.changePending = false
+    }, 'commands: coalesce change notifications')
   }
 
   /**
@@ -471,8 +480,16 @@ export class CommandRuntime extends TypertRemoteService {
     return this.layers.merge(agent, layer => layer.commands)
   }
 
-  /** Notify every registry observer without making UI refresh load-bearing. */
-  private notifyChange(): void {
+  /** Notify registry observers at once, then coalesce burst mutations. */
+  private flushChange(): void {
+    if (!this.changePending) return
+    this.changePending = false
+    // Arm the window before invoking observers so a synchronous registry
+    // mutation from a listener is queued as trailing work, not re-entered.
+    this.changeTimer = setTimeout(() => {
+      this.changeTimer = undefined
+      this.flushChange()
+    }, COMMAND_CHANGE_INTERVAL_MS)
     // Cordis emit uses Array.map: one synchronous throw starves later listeners,
     // and returned promises are discarded. Registry notifications are
     // non-vetoing, so contain each callback independently.
@@ -486,6 +503,12 @@ export class CommandRuntime extends TypertRemoteService {
         this.ctx.logger.warn(`commands/change listener threw: ${renderThrown(error)}`)
       }
     }
+  }
+
+  /** Send a leading notification and at most one trailing event per interval. */
+  private notifyChange(): void {
+    this.changePending = true
+    if (this.changeTimer === undefined) this.flushChange()
   }
 }
 

@@ -138,7 +138,8 @@ describe('CommandRuntime', () => {
     const dispose = ctx.commands.register(command('live'))
     dispose()
     dispose()
-    expect(changed).toHaveBeenCalledTimes(2)
+    expect(changed).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2), { timeout: 1000 })
 
     const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
     ctx.on('commands/change', () => { throw new Error('observer threw') })
@@ -149,14 +150,27 @@ describe('CommandRuntime', () => {
     const removeContained = ctx.commands.register(command('contained'))
     const { agent } = await mintAgentScope(ctx, 'a')
     expect(ctx.commands.find(agent, 'contained')).toBeDefined()
-    expect(afterFailures).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(afterFailures).toHaveBeenCalledTimes(1), { timeout: 1000 })
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith('commands/change listener threw: Error: observer threw')
       expect(warn).toHaveBeenCalledWith('commands/change listener rejected: Error: observer rejected')
     })
     removeContained()
     expect(ctx.commands.find(agent, 'contained')).toBeUndefined()
-    expect(afterFailures).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(afterFailures).toHaveBeenCalledTimes(2), { timeout: 1000 })
+  })
+
+  it('coalesces rapid registry mutations into one trailing notification', async () => {
+    const ctx = await mount()
+    const changed = vi.fn()
+    ctx.on('commands/change', changed)
+
+    ctx.commands.register(command('first'))
+    ctx.commands.register(command('second'))
+    ctx.commands.register(command('third'))
+    expect(changed).toHaveBeenCalledTimes(1)
+
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2), { timeout: 1000 })
   })
 
   it('rejects non-string descriptions and input hints with boundary diagnostics', async () => {
