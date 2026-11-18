@@ -1134,34 +1134,19 @@ describe('popupFor', () => {
 })
 
 describe('directory invalidation events', () => {
-  it('coalesces commands/change bursts and repulls in the background while the old snapshot serves', async () => {
-    let round = 0
-    const { source, warm, remote } = await bench({
-      commands: () => {
-        round += 1
-        return Promise.resolve({
-          commands: round === 1
-            ? S1_CMDS
-            : [{ name: round === 2 ? 'intermediate' : 'fresh', description: '', input: { hint: 'h' } }],
-        })
-      },
-    })
+  it('refreshes a changed command catalog on slash demand without polling other retained sessions', async () => {
+    let commands = S1_CMDS
+    const { source, warm, remote, listCalls } = await bench({ commands: () => Promise.resolve({ commands }) })
     await warm(proj('s1'))
-    remote.emit('commands/change', [])
-    remote.emit('commands/change', [])
+    await warm(proj('s2'))
+    commands = [{ name: 'fresh', description: '', input: { hint: 'h' } }]
+    for (let i = 0; i < 20; i++) remote.emit('commands/change', [])
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(round).toBe(2)
-    expect(source.matchSpace!(proj('s1'), '/intermediate')).not.toBeUndefined()
-    await new Promise(resolve => setTimeout(resolve, 260))
-    await new Promise(resolve => setTimeout(resolve, 0))
-    expect(round).toBe(3)
-    expect(source.matchSpace!(proj('s1'), '/fresh')).not.toBeUndefined()
-    await new Promise(resolve => setTimeout(resolve, 260))
-    remote.emit('commands/change', [])
-    await new Promise(resolve => setTimeout(resolve, 0))
-    expect(round).toBe(4)
+    expect(listCalls.map(call => call.sessionId)).toEqual(['s1', 's2'])
+    await warm(proj('s1'))
     expect(source.matchSpace!(proj('s1'), '/fresh')).not.toBeUndefined()
     expect(source.matchSpace!(proj('s1'), '/goal')).toBeUndefined()
+    expect(listCalls.map(call => call.sessionId)).toEqual(['s1', 's2', 's1'])
   })
 
   it('agent-preset/selected drops and repulls the recomposed session while leaving others served', async () => {

@@ -38,8 +38,6 @@ import { builtinRowFace, sectionRows } from './presentation.ts'
 import { claimToken } from './resolution.ts'
 import type { TokenSegment } from './popup.ts'
 
-const COMMAND_DIRECTORY_CHANGE_INTERVAL_MS = 250
-
 declare module '@deepseek-ai/dsh-api-session-controller/client' {
   interface SessionReferenceSourceMap {
     /** A command-catalog fetch waiting for initial history and its RPC result. */
@@ -126,28 +124,8 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       matchEnter: (session, line, signal, envelope) => this.matchEnter(session, line, signal, envelope),
       warm: (session) => { this.directory.warm(session.sessionId) },
     }), 'command: slash source')
-    // The event carries no catalog data; bound request fan-out while keeping one trailing refresh per burst.
-    let changeTimer: ReturnType<typeof setTimeout> | undefined
-    let changePending = false
-    const flushCommandChanges = (): void => {
-      if (!changePending) return
-      changePending = false
-      this.directory.invalidateAll()
-      changeTimer = setTimeout(() => {
-        changeTimer = undefined
-        flushCommandChanges()
-      }, COMMAND_DIRECTORY_CHANGE_INTERVAL_MS)
-    }
-    ctx.remote.$on('commands/change', () => {
-      changePending = true
-      if (changeTimer === undefined) flushCommandChanges()
-    })
-    ctx.effect(() => () => {
-      if (changeTimer !== undefined) clearTimeout(changeTimer)
-    }, 'command: coalesce catalog invalidation')
-    // A preset switch changes which commands one session's agent resolves and
-    // registers nothing globally. Drop that key's old composition before
-    // prewarming so a newly opened menu waits for the replacement catalog.
+    ctx.remote.$on('commands/change', () => { this.directory.invalidateAll() })
+    // A preset change cannot reuse the old command composition, even for a synchronous lookup.
     ctx.remote.$on('agent-preset/selected', (sessionId) => { this.directory.resetSession(sessionId) })
     ctx.on('connection/reset', () => { this.directory.resetConnected() })
   }
@@ -299,6 +277,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
 
   /** Decision table, space column: hot-key sync check; only host leadingInput claims. */
   private matchSpace(session: ClientSessionContext, token: string): PickOutcome {
+    if (token.startsWith('/')) this.directory.warm(session.sessionId)
     const claim = this.claimOf(session, token)
     return claim === undefined ? undefined : { claim }
   }
