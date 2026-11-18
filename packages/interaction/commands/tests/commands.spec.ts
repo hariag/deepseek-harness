@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createScope } from '@deepseek-ai/dsh-scope'
+import { bindScopeParent, createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import SessionStore, { type SessionId } from '@deepseek-ai/dsh-session'
@@ -107,6 +107,31 @@ describe('CommandRuntime', () => {
     await scope.dispose()
     expect(ctx.commands.list(agent)[0]?.definitionId).toBe('example/shared')
     expect((await ctx.commands.execute(agent, '/shared', [], new AbortController().signal))?.result.text).toBe('global')
+  })
+
+  it('reads the inherited catalog across preset changes without touching exact-agent commands', async () => {
+    const ctx = await mount()
+    const { agent, scope } = await mintAgentScope(ctx, 'child')
+    const first = await mintAgentScope(ctx, 'first')
+    const second = await mintAgentScope(ctx, 'second')
+    ctx.commands.register(command('shared'))
+    scope.ctx.commands.register(command('local'))
+    scope.ctx.commands.register(command('shared', 'child'))
+    expect(ctx.commands.listInherited(agent).map(row => row.name)).toEqual(['shared'])
+    const binding = bindScopeParent(agent, first.agent)
+    first.scope.ctx.commands.register({ ...command('shared'), description: 'from first', input: { hint: 'a', attachments: true } })
+    const remove = first.scope.ctx.commands.register(command('temporary'))
+    second.scope.ctx.commands.register(command('other'))
+    expect(ctx.commands.listInherited(agent)).toEqual([
+      { name: 'shared', description: 'from first', input: { hint: 'a', attachments: true } },
+      { name: 'temporary', description: 'command temporary' },
+    ])
+    remove()
+    expect(ctx.commands.listInherited(agent).map(row => row.name)).toEqual(['shared'])
+    binding.rebind(second.agent)
+    expect(ctx.commands.listInherited(agent).map(row => row.name)).toEqual(['other', 'shared'])
+    expect(ctx.commands.list(agent).map(row => row.name)).toEqual(['local', 'other', 'shared'])
+    expect((await ctx.commands.execute(agent, '/shared', [], new AbortController().signal))?.result.text).toBe('child')
   })
 
   it('removes a registration when its contributing plugin fiber is disposed', async () => {
