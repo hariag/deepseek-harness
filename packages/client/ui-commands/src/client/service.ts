@@ -38,6 +38,8 @@ import { builtinRowFace, sectionRows } from './presentation.ts'
 import { claimToken } from './resolution.ts'
 import type { TokenSegment } from './popup.ts'
 
+const COMMAND_DIRECTORY_CHANGE_INTERVAL_MS = 250
+
 declare module '@deepseek-ai/dsh-api-session-controller/client' {
   interface SessionReferenceSourceMap {
     /** A command-catalog fetch waiting for initial history and its RPC result. */
@@ -124,7 +126,25 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       matchEnter: (session, line, signal, envelope) => this.matchEnter(session, line, signal, envelope),
       warm: (session) => { this.directory.warm(session.sessionId) },
     }), 'command: slash source')
-    ctx.remote.$on('commands/change', () => { this.directory.invalidateAll() })
+    // The event carries no catalog data; bound request fan-out while keeping one trailing refresh per burst.
+    let changeTimer: ReturnType<typeof setTimeout> | undefined
+    let changePending = false
+    const flushCommandChanges = (): void => {
+      if (!changePending) return
+      changePending = false
+      this.directory.invalidateAll()
+      changeTimer = setTimeout(() => {
+        changeTimer = undefined
+        flushCommandChanges()
+      }, COMMAND_DIRECTORY_CHANGE_INTERVAL_MS)
+    }
+    ctx.remote.$on('commands/change', () => {
+      changePending = true
+      if (changeTimer === undefined) flushCommandChanges()
+    })
+    ctx.effect(() => () => {
+      if (changeTimer !== undefined) clearTimeout(changeTimer)
+    }, 'command: coalesce catalog invalidation')
     // A preset switch changes which commands one session's agent resolves and
     // registers nothing globally. Drop that key's old composition before
     // prewarming so a newly opened menu waits for the replacement catalog.

@@ -1134,7 +1134,7 @@ describe('popupFor', () => {
 })
 
 describe('directory invalidation events', () => {
-  it('commands/change repulls in the background while the old snapshot serves', async () => {
+  it('coalesces commands/change bursts and repulls in the background while the old snapshot serves', async () => {
     let round = 0
     const { source, warm, remote } = await bench({
       commands: () => {
@@ -1142,13 +1142,24 @@ describe('directory invalidation events', () => {
         return Promise.resolve({
           commands: round === 1
             ? S1_CMDS
-            : [{ name: 'fresh', description: '', input: { hint: 'h' } }],
+            : [{ name: round === 2 ? 'intermediate' : 'fresh', description: '', input: { hint: 'h' } }],
         })
       },
     })
     await warm(proj('s1'))
     remote.emit('commands/change', [])
+    remote.emit('commands/change', [])
     await new Promise(resolve => setTimeout(resolve, 0))
+    expect(round).toBe(2)
+    expect(source.matchSpace!(proj('s1'), '/intermediate')).not.toBeUndefined()
+    await new Promise(resolve => setTimeout(resolve, 260))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(round).toBe(3)
+    expect(source.matchSpace!(proj('s1'), '/fresh')).not.toBeUndefined()
+    await new Promise(resolve => setTimeout(resolve, 260))
+    remote.emit('commands/change', [])
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(round).toBe(4)
     expect(source.matchSpace!(proj('s1'), '/fresh')).not.toBeUndefined()
     expect(source.matchSpace!(proj('s1'), '/goal')).toBeUndefined()
   })
