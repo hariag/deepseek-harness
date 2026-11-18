@@ -1,10 +1,4 @@
-/**
- * Command-directory cache keyed by session: one entry per served catalog —
- * every session is agent-backed, so `command.list({sessionId})` is the only
- * request fields. Each entry keeps the single-flight / soft-hard invalidation
- * / epoch-guard behavior of the original global cache; the session-key axis
- * is the only extra dimension.
- */
+/** Per-session slash command catalogs, invalidated by host registry and connection events. */
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { resolveCommand } from '@deepseek-ai/dsh-commands/builtin'
@@ -25,8 +19,9 @@ export type FetchCommands = (sessionId: SessionId) => Promise<readonly CommandDe
 class Entry {
   state: DirectoryStatus = 'cold'
   commands: readonly CommandDescriptor[] = []
-  /** Bumped at each pull start; only the latest pull may publish its outcome. */
-  epoch = 0
+  /** Registry revision at the start of the last completed request. */
+  revision = -1
+  flight: Promise<void> | undefined
   lastError: unknown
   waiters: Array<() => void> = []
 }
@@ -34,6 +29,8 @@ class Entry {
 /** The session-keyed directory cache. Plain class — the owning service wires events and RPC. */
 export class CommandDirectory {
   private readonly entries = new Map<SessionId, Entry>()
+
+  private revision = 0
 
   constructor(private readonly fetchCommands: FetchCommands) {}
 
@@ -58,33 +55,22 @@ export class CommandDirectory {
     return resolveCommand(name, entry.commands)
   }
 
-  /** Soft invalidation (commands-changed): background repull on every touched key; ready snapshots keep serving. */
+  /** A registry change costs no RPCs. Only a reader of a stale catalog will reload it. */
   invalidateAll(): void {
-    for (const key of this.entries.keys()) void this.refresh(key)
+    this.revision++
   }
 
-  /**
-   * Drop one Session's obsolete composition-specific snapshot and prewarm its replacement.
-   * @param sessionId - Session whose effective command composition changed.
-   */
+  /** Drop this preset's catalog and wake pending readers to join its new composition. */
   resetSession(sessionId: SessionId): void {
-    const entry = this.entry(sessionId)
-    entry.state = 'cold'
-    entry.commands = []
-    entry.lastError = undefined
-    void this.refresh(sessionId)
+    const entry = this.entries.get(sessionId)
+    if (entry === undefined) return
+    this.entries.delete(sessionId)
+    notifyWaiters(entry)
   }
 
-  /**
-   * Hard reset on reconnect: every entry drops its snapshot (the agent world
-   * may have changed shape across the generation) and prewarms.
-   */
+  /** Discard old connection data without reopening historical sessions. */
   resetConnected(): void {
-    for (const [key, entry] of this.entries) {
-      entry.state = 'cold'
-      entry.commands = []
-      void this.refresh(key)
-    }
+    for (const key of this.entries.keys()) this.resetSession(key)
   }
 
   /**
@@ -94,55 +80,55 @@ export class CommandDirectory {
    */
   warm(sessionId: SessionId): void {
     const entry = this.entry(sessionId)
-    if (entry.state === 'cold' || entry.state === 'failed') void this.refresh(sessionId)
+    if (entry.state !== 'ready' || entry.revision !== this.revision) void this.refresh(sessionId)
   }
 
-  /**
-   * Start one pull for one session. Publishes ready/failed only while it is
-   * still the key's latest pull (epoch guard); a ready snapshot is not
-   * demoted while the pull flies.
-   * @param sessionId - session key.
-   * @returns settled when this pull's outcome is published or discarded.
-   */
-  async refresh(sessionId: SessionId): Promise<void> {
+  /** Start or join the catalog fetch for this Session and connection/preset generation. */
+  refresh(sessionId: SessionId): Promise<void> {
     const entry = this.entry(sessionId)
-    const epoch = ++entry.epoch
+    if (entry.flight !== undefined) return entry.flight
+    const flight = Promise.withResolvers<void>()
+    entry.flight = flight.promise
     if (entry.state !== 'ready') entry.state = 'pending'
+    void this.load(sessionId, entry, this.revision).finally(flight.resolve)
+    return flight.promise
+  }
+
+  private async load(sessionId: SessionId, entry: Entry, revision: number): Promise<void> {
     try {
-      const commands = await this.fetchCommands(sessionId)
-      if (epoch !== entry.epoch) return
-      entry.commands = commands
+      entry.commands = await this.fetchCommands(sessionId)
       entry.state = 'ready'
       entry.lastError = undefined
     } catch (error) {
-      if (epoch !== entry.epoch) return
       entry.commands = []
       entry.state = 'failed'
       entry.lastError = error
     } finally {
-      if (epoch === entry.epoch) notifyWaiters(entry)
+      // A hard reset detached this cell from the map, so a late result
+      // can never overwrite a replacement preset or connection.
+      entry.revision = revision
+      entry.flight = undefined
+      notifyWaiters(entry)
     }
   }
 
   /**
-   * Strong-wait until one session's catalog is servable (the enter-
-   * adjudication "directory must be reached" rule): ready returns at once;
-   * cold/failed launch a fresh pull; pending joins the flying one. Rejects
-   * when the awaited pull fails or the signal aborts.
-   * @param sessionId - session key.
-   * @param signal - attempt-scoped abort (the SubmitAttempt signal).
-   * @returns the hot command snapshot.
+   * An async slash operation needs a catalog at least as recent as the registry
+   * at its start. Later registry events leave it stale for the next operation
+   * without starving this one in a continuously changing host.
    */
   async ensureReady(sessionId: SessionId, signal: AbortSignal): Promise<readonly CommandDescriptor[]> {
-    const entry = this.entry(sessionId)
+    const revision = this.revision
     while (true) {
-      if (entry.state === 'ready') return entry.commands
-      if (entry.state !== 'pending') void this.refresh(sessionId)
-      await settled(entry, signal)
-      if (entry.state === 'failed') {
+      if (signal.aborted) throw abortReason(signal)
+      const entry = this.entry(sessionId)
+      if (entry.state === 'ready' && entry.revision >= revision) return entry.commands
+      const next = settled(entry, signal)
+      void this.refresh(sessionId)
+      await next
+      if (this.entries.get(sessionId) === entry && entry.state === 'failed' && entry.revision >= revision) {
         throw new Error(`command directory warmup failed: ${entry.lastError instanceof Error ? entry.lastError.message : String(entry.lastError)}`)
       }
-      // Still pending (the awaited pull was superseded) → wait for the winner.
     }
   }
 

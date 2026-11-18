@@ -1,10 +1,4 @@
-/**
- * CommandDirectory unit tests over the session-key axis: per-key status
- * transitions and epoch guard, key isolation across sessions, soft
- * invalidation (invalidateAll), the reconnect hard reset (resetConnected:
- * every entry drops its snapshot and prewarms), the warm hook's cold/failed
- * gate, and the per-key ensureReady strong-wait policy.
- */
+/** Per-session catalog demand, invalidation, generation and cancellation behavior. */
 import { describe, expect, it } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -118,120 +112,72 @@ describe('status and resolve (per key)', () => {
   })
 })
 
-describe('epoch guard (per key)', () => {
-  it('a superseded pull cannot overwrite the newer one (old resolves after new)', async () => {
-    const { dir, pull } = bench()
-    const first = dir.refresh(S1)
-    const second = dir.refresh(S1)
-    pull(S1, 1).resolve(CMDS)
-    await second
-    expect(dir.resolve(S1, 'plan')).toBeDefined()
-    pull(S1, 0).resolve([{ name: 'stale', description: 'old world' }])
-    await first
-    expect(dir.resolve(S1, 'stale')).toBeUndefined()
-    expect(dir.resolve(S1, 'plan')).toBeDefined()
-  })
-
-  it('a superseded failure cannot demote the newer success', async () => {
-    const { dir, pull } = bench()
-    const first = dir.refresh(S1)
-    const second = dir.refresh(S1)
-    pull(S1, 1).resolve(CMDS)
-    await second
-    pull(S1, 0).reject(new Error('late failure'))
-    await first
-    expect(dir.status(S1)).toBe('ready')
-    expect(dir.resolve(S1, 'plan')).toBeDefined()
-  })
-
-  it('epochs are per key: one session supersede leaves another session epoch alone', async () => {
-    const { dir, pull } = bench()
-    const one = dir.refresh(S1)
-    void dir.refresh(S2)
-    void dir.refresh(S2) // supersedes the s2 pull only
-    pull(S1, 0).resolve(CMDS)
-    await one
-    expect(dir.status(S1)).toBe('ready')
-  })
-})
-
-describe('invalidateAll (commands-changed soft)', () => {
-  it('repulls every touched key in the background while ready snapshots keep serving', async () => {
-    const { dir, pull, countOf } = bench()
+describe('invalidation and single-flight reads', () => {
+  it('does not pull historical sessions during a registry storm', async () => {
+    const { dir, pull, calls } = bench()
     const a = dir.refresh(S1)
     const b = dir.refresh(S2)
     pull(S1, 0).resolve(CMDS)
     pull(S2, 0).resolve(S2_CMDS)
     await Promise.all([a, b])
 
-    dir.invalidateAll()
-    expect(countOf(S1)).toBe(2)
-    expect(countOf(S2)).toBe(2)
-    expect(dir.status(S1)).toBe('ready')
-    expect(dir.resolve(S2, 'attach')).toBeDefined()
-
-    pull(S1, 1).resolve([{ name: 'fresh', description: 'new world' }])
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(dir.resolve(S1, 'fresh')).toBeDefined()
-    expect(dir.resolve(S1, 'plan')).toBeUndefined()
+    for (let i = 0; i < 100; i++) dir.invalidateAll()
+    expect(calls).toEqual([S1, S2])
+    expect(dir.resolve(S1, 'goal')).toBeDefined()
+    const reader = dir.ensureReady(S1, new AbortController().signal)
+    dir.warm(S1)
+    const second = dir.ensureReady(S1, new AbortController().signal)
+    expect(calls).toEqual([S1, S2, S1])
+    pull(S1, 1).resolve([])
+    await expect(reader).resolves.toEqual([])
+    await expect(second).resolves.toEqual([])
+    expect(dir.resolve(S1, 'goal')).toBeUndefined()
   })
 
-  it('an untouched directory invalidates to nothing (no keys, no pulls)', () => {
-    const { dir, calls } = bench()
+  it('only a new reader after invalidation needs a later request', async () => {
+    const { dir, pull, calls } = bench()
+    const signal = new AbortController().signal
+    const first = dir.ensureReady(S1, signal)
     dir.invalidateAll()
-    expect(calls).toEqual([])
+    const second = dir.ensureReady(S1, signal)
+    expect(calls).toEqual([S1])
+    pull(S1, 0).resolve(CMDS)
+    await expect(first).resolves.toEqual(CMDS)
+    expect(calls).toEqual([S1, S1])
+    dir.invalidateAll()
+    pull(S1, 1).resolve(S2_CMDS)
+    await expect(second).resolves.toEqual(S2_CMDS)
+    expect(calls).toEqual([S1, S1])
   })
-})
 
-describe('resetConnected (reconnect hard)', () => {
-  it('every entry drops its snapshot immediately and prewarms', async () => {
-    const { dir, pull, countOf } = bench()
+  it('reconnect forgets idle sessions without fetching them', async () => {
+    const { dir, pull, calls } = bench()
     const a = dir.refresh(S1)
     const b = dir.refresh(S2)
     pull(S1, 0).resolve(CMDS)
     pull(S2, 0).resolve(S2_CMDS)
     await Promise.all([a, b])
-
     dir.resetConnected()
-    // Hard: the agent world may have changed shape across the generation.
-    expect(dir.status(S1)).toBe('pending')
-    expect(dir.resolve(S1, 'plan')).toBeUndefined()
-    expect(dir.status(S2)).toBe('pending')
+    expect(dir.status(S1)).toBe('cold')
     expect(dir.resolve(S2, 'attach')).toBeUndefined()
-    expect(countOf(S1)).toBe(2)
-    expect(countOf(S2)).toBe(2)
-
-    pull(S1, 1).resolve(CMDS)
-    pull(S2, 1).resolve(S2_CMDS)
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(dir.status(S1)).toBe('ready')
-    expect(dir.resolve(S2, 'attach')).toBeDefined()
+    expect(calls).toEqual([S1, S2])
   })
-})
 
-describe('resetSession (preset-change hard)', () => {
-  it('drops and prewarms only the changed Session', async () => {
-    const { dir, pull, countOf } = bench()
-    const first = dir.refresh(S1)
-    const second = dir.refresh(S2)
-    pull(S1, 0).resolve(CMDS)
-    pull(S2, 0).resolve(S2_CMDS)
-    await Promise.all([first, second])
-
-    dir.resetSession(S1)
-    expect(dir.status(S1)).toBe('pending')
-    expect(dir.resolve(S1, 'plan')).toBeUndefined()
-    expect(dir.status(S2)).toBe('ready')
-    expect(dir.resolve(S2, 'attach')).toBeDefined()
-    expect(countOf(S1)).toBe(2)
-    expect(countOf(S2)).toBe(1)
-
-    pull(S1, 1).resolve([{ name: 'fresh', description: 'new composition' }])
+  it.each(['preset', 'connection'])('a %s reset wakes readers and fences the old in-flight catalog', async (reset) => {
+    const { dir, pull, calls } = bench()
+    const signal = new AbortController().signal
+    const wait = dir.ensureReady(S1, signal)
+    if (reset === 'preset') dir.resetSession(S1)
+    else dir.resetConnected()
+    expect(dir.status(S1)).toBe('cold')
+    const second = dir.ensureReady(S1, signal)
+    expect(calls).toEqual([S1, S1])
+    pull(S1, 1).resolve(S2_CMDS)
+    await expect(wait).resolves.toEqual(S2_CMDS)
+    await expect(second).resolves.toEqual(S2_CMDS)
+    pull(S1, 0).reject(new Error('old generation'))
     await Promise.resolve()
-    await Promise.resolve()
-    expect(dir.resolve(S1, 'fresh')).toBeDefined()
+    expect(dir.resolve(S1, 'attach')).toBeDefined()
   })
 })
 
@@ -328,14 +274,5 @@ describe('ensureReady (per key)', () => {
     const ac = new AbortController()
     ac.abort() // bare abort: the DOMException reason is itself an Error and travels as-is
     await expect(dir.ensureReady(S1, ac.signal)).rejects.toThrow(/aborted/)
-  })
-
-  it('keeps waiting across a superseded pull and settles on the winner', async () => {
-    const { dir, pull } = bench()
-    const wait = dir.ensureReady(S1, signal())
-    void dir.refresh(S1) // supersedes pull #0 with pull #1
-    pull(S1, 0).resolve([{ name: 'stale', description: 'loser' }])
-    pull(S1, 1).resolve(CMDS)
-    await expect(wait).resolves.toEqual(CMDS)
   })
 })

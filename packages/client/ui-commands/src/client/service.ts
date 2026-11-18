@@ -125,9 +125,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       warm: (session) => { this.directory.warm(session.sessionId) },
     }), 'command: slash source')
     ctx.remote.$on('commands/change', () => { this.directory.invalidateAll() })
-    // A preset switch changes which commands one session's agent resolves and
-    // registers nothing globally. Drop that key's old composition before
-    // prewarming so a newly opened menu waits for the replacement catalog.
+    // A preset change cannot reuse the old command composition, even for a synchronous lookup.
     ctx.remote.$on('agent-preset/selected', (sessionId) => { this.directory.resetSession(sessionId) })
     ctx.on('connection/reset', () => { this.directory.resetConnected() })
   }
@@ -279,6 +277,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
 
   /** Decision table, space column: hot-key sync check; only host leadingInput claims. */
   private matchSpace(session: ClientSessionContext, token: string): PickOutcome {
+    if (token.startsWith('/')) this.directory.warm(session.sessionId)
     const claim = this.claimOf(session, token)
     return claim === undefined ? undefined : { claim }
   }
