@@ -9,7 +9,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AttachmentError, admitEncodedImages } from '@deepseek-ai/dsh-attachment'
 import type { EncodedImageAttachment, FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment/types'
 import type { FileBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
-import { NamedEntries, ScopedLayers } from '@deepseek-ai/dsh-scope'
+import { NamedEntries, ScopedLayers, scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { ScopeKey, ScopeLayer } from '@deepseek-ai/dsh-scope'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session'
@@ -322,7 +322,22 @@ export class CommandRuntime extends TypertRemoteService {
    */
   @Remote
   list(agent: Agent): readonly CommandDescriptor[] {
-    return Object.freeze([...this.view(agent).values()]
+    return this.descriptors(agent)
+  }
+
+  /**
+   * Host plugins that maintain an exact-agent overlay can read its underlying
+   * catalog without removing their registrations. The Agent's current parent
+   * chain is consulted afresh, including globals for an unparented Agent.
+   * @param agent - the real agent whose exact overlay is excluded.
+   * @returns immutable descriptors inherited from ancestors and the global layer.
+   */
+  listInherited(agent: Agent): readonly CommandDescriptor[] {
+    return this.descriptors(scopeParentOf(agent))
+  }
+
+  private descriptors(scope: ScopeKey | undefined): readonly CommandDescriptor[] {
+    return Object.freeze([...this.view(scope).values()]
       .map(command => command.descriptor)
       // Names are unique in the effective view, so equality is impossible.
       .sort((left, right) => left.name < right.name ? -1 : 1))
@@ -476,8 +491,8 @@ export class CommandRuntime extends TypertRemoteService {
   }
 
   /** Resolve global definitions followed by exact scoped shadows. */
-  private view(agent: Agent): Map<string, RegisteredCommand> {
-    return this.layers.merge(agent, layer => layer.commands)
+  private view(scope: ScopeKey | undefined): Map<string, RegisteredCommand> {
+    return this.layers.merge(scope, layer => layer.commands)
   }
 
   /** Notify registry observers at once, then coalesce burst mutations. */
