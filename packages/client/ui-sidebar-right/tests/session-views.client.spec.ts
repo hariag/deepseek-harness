@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from 'vitest'
-import { SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
+import { type SessionFixture, SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { TabId } from '@deepseek-ai/dsh-client-ui-dockkit'
 import { SidebarSessionView } from '../src/client/session-view.ts'
@@ -18,10 +18,10 @@ afterEach(async () => {
   vi.restoreAllMocks()
 })
 
-async function runtime() {
+async function runtime(sessionA: Pick<SessionFixture, 'initialOpen'> = {}) {
   const runtime = await SlotTestRuntime.create()
   runtimes.push(runtime)
-  await runtime.sessions.add({ id: A })
+  await runtime.sessions.add({ id: A, ...sessionA })
   await runtime.sessions.add({ id: B })
   return runtime
 }
@@ -85,6 +85,28 @@ it('retires only unselected Views without retained bodies and rejects released r
   views.select(A)
   views.mount(a.reference)()
   expect(views.source.getSnapshot()).toEqual([])
+})
+
+it('releases a still-opening View quietly when switching Sessions', async () => {
+  const opening = Promise.withResolvers<undefined>()
+  const r = await runtime({ initialOpen: () => opening.promise })
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const views = new SidebarSessionViews(r.sessions)
+  owners.push(views)
+  views.select(A)
+  const first = views.source.getSnapshot()[0]!.reference
+  const unmount = views.mount(first)
+  views.select(B)
+  unmount()
+  await expect(first.ready).rejects.toThrow('released')
+  await expect(views.source.getSnapshot()[0]!.reference.ready).resolves.toMatchObject({ sessionId: B })
+
+  views.select(A)
+  const reopened = views.source.getSnapshot()[0]!.reference
+  expect(reopened).not.toBe(first)
+  opening.resolve(undefined)
+  await expect(reopened.ready).resolves.toMatchObject({ sessionId: A })
+  expect(error).not.toHaveBeenCalled()
 })
 
 it('reports opening failure and releases Views even when committed roots are still present', async () => {
